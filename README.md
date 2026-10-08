@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#persyaratan)
-[![Tests](https://img.shields.io/badge/tests-101%20passed-brightgreen)](#pengembangan)
+[![Tests](https://img.shields.io/badge/tests-101%20passed-brightgreen)](docs/pengembangan.md)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#persyaratan)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -51,76 +51,34 @@ PEMAKAIAN TOKEN
 ```
 
 Angka dolar selalu disertai nilai **quota** aslinya dalam tanda kurung, jadi bisa
-langsung dicocokkan dengan response gateway tanpa baris terpisah. Untuk key dengan
-kuota terbatas, ketiga angka itu terisi penuh:
-
-```console
-$ aihub-usage key
-
-API KEY INI
-  nama          : kontraktor-1
-  limit key     : $5.00  (2,500,000 quota)
-  terpakai key  : $2.00  (1,000,000 quota)
-  sisa kuota key: $3.00  (1,500,000 quota)
-  kadaluarsa    : 2026-10-08 12:18
-  batas model   : gpt-5.5
-```
-
-`aihub-usage tokens` menambah rincian per model:
+langsung dicocokkan dengan response gateway. `aihub-usage tokens` menambah rincian
+per model:
 
 ```console
 $ aihub-usage tokens
 
 PEMAKAIAN TOKEN
-  dasar hitung  : 4 log terakhir (2026-10-08 17:18 s/d 2026-10-08 18:20)
-  request       : 2
-  token masuk   : 2,000
-  token keluar  : 440
-  TOTAL TOKEN   : 2,440
-  rata-rata     : 1,220 token/request
-  biaya jendela : $0.0350  (Rp 630)
-  biaya 1jt tok : $14.34
-
+  ...
   PER MODEL
   model                           req        masuk       keluar        total      biaya
   gpt-5.5                           1        1,200          340        1,540    $0.0250
   deepseek-v4.1-flash               1          800          100          900    $0.0100
-
-  kuota terpakai: 617,250 quota = $1.23
-  sisa kuota    : 41,258,875 quota = $82.52
 ```
-
----
-
-## Daftar isi
-
-- [Fitur](#fitur)
-- [Persyaratan](#persyaratan)
-- [Instalasi](#instalasi)
-- [Penggunaan](#penggunaan)
-- [Konfigurasi](#konfigurasi)
-- [Integrasi (script & cron)](#integrasi-script--cron)
-- [Cara kerja & catatan angka](#cara-kerja--catatan-angka)
-- [Pengembangan](#pengembangan)
-- [Keamanan](#keamanan)
-- [Lisensi](#lisensi)
 
 ## Fitur
 
 - **Sisa credit akun** — total credit, terpakai, dan sisa (USD + estimasi Rupiah).
-- **Pemakaian token** — token masuk/keluar/total, rata-rata per request, biaya per
-  juta token, dan rincian per model (`tokens`).
-- **Arsip log lokal (opsional, default OFF)** — mengakumulasi log antar-run agar
-  perhitungan token melampaui batas 1000 log terakhir milik gateway. Aktifkan
-  lewat `local_store` di config; output selalu menyebut mode yang dipakai.
 - **Kuota per API key** — status unlimited, batas, kadaluarsa, batas model, plus
   nilai **quota** asli di samping setiap angka dolar.
-- **Log request** — waktu, model, token masuk/keluar, biaya, dan durasi per panggilan.
+- **Pemakaian token** — token masuk/keluar/total, rata-rata per request, biaya per
+  juta token, dan rincian per model (`tokens`).
+- **Log request** — waktu, model, token masuk/keluar, biaya, dan durasi.
 - **Daftar model** — model yang bisa dipakai oleh key tersebut.
 - **Probe** — kirim satu request kecil untuk memastikan key benar-benar jalan.
 - **Mode JSON & exit code** — siap dipakai di script, cron, atau monitoring.
-- **Cepat** — semua endpoint diambil paralel dan respons diterima dalam gzip;
-  `aihub-usage` turun dari ~0,8 s ke ~0,3 s dibanding versi sekuensial.
+- **Arsip log lokal (opsional, default OFF)** — mengakumulasi log antar-run agar
+  perhitungan token melampaui batas 1000 log terakhir milik gateway.
+- **Cepat** — semua endpoint diambil paralel dan respons diterima dalam gzip.
 - **Tanpa dependensi** — hanya stdlib Python 3.8+.
 - **Key tidak pernah bocor** — key hanya tampil sebagai nama, tidak pernah di-print.
 
@@ -139,11 +97,10 @@ cd aihub-usage
 ./install.sh
 ```
 
-`install.sh` membuat symlink `~/.local/bin/aihub-usage` → file di repo. Karena itu
-`git pull` sudah cukup untuk memakai versi terbaru; tidak perlu install ulang.
-
-Script ini **tidak** menyentuh file konfigurasi shell Anda. Kalau `~/.local/bin`
-belum ada di PATH, ia hanya menampilkan perintah yang perlu Anda tambahkan sendiri.
+`install.sh` membuat symlink `~/.local/bin/aihub-usage` → file di repo, jadi
+`git pull` sudah cukup untuk memakai versi terbaru. Script ini **tidak** menyentuh
+file konfigurasi shell Anda; kalau `~/.local/bin` belum ada di PATH, ia hanya
+menampilkan perintah yang perlu Anda tambahkan sendiri.
 
 ```bash
 BIN_DIR=~/bin ./install.sh    # pasang symlink di folder lain
@@ -186,8 +143,7 @@ aihub-usage [command] [options]
 | `--warn-below USD` | Keluar dengan exit code `3` bila sisa credit di bawah nilai ini (saldo akun ikut diambil walau command-nya bukan `balance`) |
 | `--model NAMA` | Model untuk `probe` |
 | `--max-tokens N` | `max_tokens` saat `probe` (default `1`, minimal `1`) |
-| `--store` | Aktifkan arsip log lokal untuk run ini (default: ikut `local_store` di config) |
-| `--no-store` | Paksa hitung hanya dari jendela log API (menang atas config/env) |
+| `--store` / `--no-store` | Paksa arsip lokal aktif / nonaktif untuk run ini |
 | `--anthropic` | `probe` lewat `/v1/messages` (protokol Anthropic) |
 
 Contoh:
@@ -197,10 +153,8 @@ aihub-usage                        # ringkasan lengkap
 aihub-usage balance                # cek saldo saja
 aihub-usage tokens                 # pemakaian token + rincian per model
 aihub-usage logs -n 20             # 20 request terakhir
-aihub-usage models                 # model yang tersedia untuk key ini
 aihub-usage status                 # info gateway (tidak butuh API key)
 aihub-usage probe --anthropic      # tes key lewat /v1/messages
-aihub-usage probe --json           # hasil probe sebagai JSON
 aihub-usage key --warn-below 5     # cek kuota key + peringatan saldo
 ```
 
@@ -236,75 +190,6 @@ arahkan saja ke host new-api lain.
 | `AIHUB_DB` | Lokasi arsip log lokal (default `~/.local/share/aihub-usage/logs.db`) |
 | `AIHUB_CLI` | Path script untuk test suite |
 
-### Arsip log lokal (opsional)
-
-`/api/log/token` hanya mengembalikan **1000 baris terakhir** (nilai `MaxRecentItems`
-di new-api, di-hardcode) dan tidak punya parameter paginasi. Jadi angka token dari
-API saja selalu terpotong. Arsip lokal mengakumulasi log antar-run sehingga
-cakupannya bertambah setiap kali CLI dijalankan.
-
-**Default OFF** — tidak ada file yang dibuat sampai Anda mengaktifkannya:
-
-```bash
-aihub-usage store on              # aktifkan permanen (local_store=true)
-aihub-usage store off             # nonaktifkan lagi
-aihub-usage store                 # lihat status (aktif/nonaktif, path config & arsip)
-aihub-usage tokens --store        # sekali jalan saja, tanpa mengubah config
-AIHUB_STORE=1 aihub-usage tokens  # lewat environment
-```
-
-`store on`/`store off` mengubah `~/.config/aihub/config.json` dan **tidak perlu
-API key** — jadi tidak perlu menempelkan `--key` hanya untuk mematikan fitur ini.
-Setelah `store off`, perintah biasa langsung kembali menghitung dari API saja tanpa
-`--no-store`:
-
-```console
-$ aihub-usage store
-Arsip log lokal: nonaktif (default)
-  config : /Users/anda/.config/aihub/config.json
-  db     : /Users/anda/.local/share/aihub-usage/logs.db (belum dibuat)
-  flag   : local_store tidak diset
-  ubah   : aihub-usage store on  |  aihub-usage store off
-```
-
-`store off` tidak menghapus arsip yang sudah terkumpul — script memberi tahu
-lokasinya supaya Anda bisa menghapusnya sendiri bila mau.
-
-Isi `~/.config/aihub/config.json` setelah diaktifkan:
-
-```json
-{
-  "api_key": "sk-...",
-  "local_store":true
-}
-```
-
-Setiap kali arsip dipakai, output menyebut mode-nya secara eksplisit — aktif
-menghitung gabungan arsip + API, nonaktif menghitung dari jendela API saja:
-
-```console
-$ aihub-usage tokens --store
-
-PEMAKAIAN TOKEN
-  dasar hitung  : 1,204 log di arsip lokal (2026-10-01 09:12 s/d 2026-10-08 17:56)
-  run ini       : 87 log baru diarsipkan
-  mode          : ARSIP LOKAL AKTIF — token dihitung dari gabungan log tersimpan + log yang baru diambil dari API
-  arsip         : /Users/anda/.local/share/aihub-usage/logs.db
-  ...
-
-$ aihub-usage tokens
-
-PEMAKAIAN TOKEN
-  dasar hitung  : 533 log terakhir (2026-10-08 08:38 s/d 2026-10-08 17:56)
-  mode          : API SAJA — arsip lokal tidak aktif, token hanya dihitung dari jendela log yang dikirim gateway
-  ...
-```
-
-Dedupe memakai `(key_hash, id)`, jadi menjalankan CLI berkali-kali tidak
-menghitung ganda. Kalau antar-run ada log yang terlewat (kalah cepat dari batas
-1000 log), script mencetak baris `PERINGATAN` — jalankan lebih sering, mis. lewat
-cron, supaya celahnya makin kecil.
-
 ## Integrasi (script & cron)
 
 ```bash
@@ -312,21 +197,16 @@ aihub-usage --json > saldo.json          # seluruh hasil sebagai JSON
 aihub-usage balance --warn-below 5       # exit 3 kalau sisa credit < $5
 ```
 
-Exit code:
-
-| Code | Arti |
+| Exit code | Arti |
 |---|---|
 | `0` | Normal |
-| `1` | Gagal — key ditolak, error jaringan, key belum diset, atau bagian yang diminta gagal diambil (mis. `logs` ditolak gateway) |
+| `1` | Gagal — key ditolak, error jaringan, key belum diset, atau bagian yang diminta gagal diambil |
 | `2` | Argumen salah (mis. `-n -1`, `--max-tokens 0`, command tidak dikenal) |
 | `3` | Sisa credit di bawah `--warn-below` |
 
-Bagian yang gagal tidak pernah dilaporkan sebagai "tidak ada data": gateway new-api
-membalas kegagalan handler dengan **HTTP 200 + `{"success":false}`**, dan script
-memperlakukannya sebagai error (exit `1`), bukan sebagai hasil kosong.
-
-Contoh pemakaian di cron — kirim notifikasi bila saldo menipis, tanpa salah
-menganggap error jaringan sebagai saldo habis:
+Bagian yang gagal tidak pernah dilaporkan sebagai "tidak ada data": gateway
+new-api membalas kegagalan handler dengan HTTP 200 + `{"success":false}`, dan
+script memperlakukannya sebagai error.
 
 ```bash
 #!/usr/bin/env bash
@@ -340,151 +220,14 @@ case $rc in
 esac
 ```
 
-## Cara kerja & catatan angka
+## Dokumentasi
 
-Semua data diambil dari endpoint new-api yang memang sudah ada:
-
-| Kebutuhan | Endpoint | Auth |
-|---|---|---|
-| Total & sisa credit akun | `GET /v1/dashboard/billing/subscription` + `GET /v1/dashboard/billing/usage` | API key |
-| Kuota & pemakaian key | `GET /api/usage/token/` | API key |
-| Log request key ini | `GET /api/log/token` | API key |
-| Pemakaian token (masuk/keluar, per model) | `GET /api/log/token` (dijumlahkan dari kolom `prompt_tokens`/`completion_tokens`) | API key |
-| Daftar model | `GET /v1/models` | API key |
-| Info gateway (kurs, satuan) | `GET /api/status` | publik |
-| Probe 1 request | `POST /v1/chat/completions` atau `POST /v1/messages` | API key |
-
-### Kenapa cepat
-
-Dua hal yang membuat CLI ini selesai dalam ~0,3 s, bukan ~0,8 s:
-
-- **Request paralel.** Semua endpoint di atas saling independen, jadi dijalankan
-  bersamaan lewat `ThreadPoolExecutor`. Sebelumnya tiap endpoint membuka koneksi
-  TLS sendiri secara berurutan, jadi biayanya dijumlahkan (6 × ~140 ms). Sekarang
-  totalnya ditentukan endpoint terlama (`/api/log/token`), bukan jumlah endpoint.
-- **gzip.** Request mengirim `Accept-Encoding: gzip, deflate`. `/api/log/token`
-  bisa >500 KB mentah dan turun ke ~30 KB, jadi endpoint yang paling berat itu
-  selesai jauh lebih cepat. Kalau gateway tidak mendukung kompresi, tidak ada
-  yang berubah — respons dibaca apa adanya.
-
-`/api/status` dan `/v1/models` tidak dikompresi gateway (masing-masing ~90 KB dan
-~19 KB), jadi keduanya memang tetap menjadi bagian biaya terbesar pada perintah
-yang memakainya.
-
-Beberapa detail yang mudah salah baca:
-
-- **Satuan internal gateway adalah `quota`.** `500.000 quota = $1`, dan nilainya
-  diambil dinamis dari `/api/status` — bukan hardcode. Setiap angka kuota key
-  (`limit key`, `terpakai key`, `sisa kuota key`) ditampilkan sebagai dolar
-  **beserta nilai quota aslinya dalam tanda kurung**, jadi bisa dicocokkan
-  langsung dengan response `/api/usage/token` tanpa baris terpisah.
-- **Angka token dari API adalah jendela log, bukan total seumur hidup key.**
-  Tidak ada endpoint new-api yang memberi agregat token untuk sebuah API key, jadi
-  token dijumlahkan dari `/api/log/token` — dan endpoint itu mengembalikan paling
-  banyak `MaxRecentItems` baris terakhir (default **1000** di new-api, hardcode,
-  tanpa paginasi). Bagian `PEMAKAIAN TOKEN` selalu menyebut **dasar hitung** dan
-  **mode**-nya. Hanya baris `type=2` (pemakaian) yang dihitung: baris error/refund
-  bernilai 0 token dan tidak dihitung sebagai request.
-- **Arsip lokal mengatasi batas 1000 itu, tapi tidak menghapus batasnya.**
-  Cakupannya hanya seluas yang sempat terarsip: log yang muncul dan hilang di
-  antara dua run (lebih dari 1000 request) tetap tidak terekam. Karena itu run
-  berkala lebih penting daripada run sesekali, dan `PERINGATAN` muncul saat celah
-  itu terdeteksi.
-- **`biaya 1jt tok` adalah biaya rata-rata per 1 juta token** pada jendela itu
-  (campuran model), bukan tarif resmi satu model.
-- **`total_usage` dari endpoint billing satuannya cent**, sedangkan
-  `hard_limit_usd` satuannya dolar. Jadi
-  `sisa = hard_limit_usd − total_usage / 100`.
-- **`hard_limit_usd` bukan "batas yang boleh dipakai"**, melainkan total credit
-  yang pernah diberikan (terpakai + sisa).
-- **Key dengan kuota unlimited** melaporkan `total_granted`/`total_available`
-  bernilai `0` dan `unlimited_quota:true`. Itu bukan berarti saldo kosong — script
-  menuliskan baris `catatan` untuk menjelaskannya dan mengarahkan ke `SISA CREDIT`.
-- **Statistik bisa per-key, bukan per-akun**, tergantung konfigurasi gateway.
-  Bila angka billing berbeda dari `/api/usage/token/`, script menandainya dengan
-  baris `catatan` — bukan diam-diam memilih salah satu.
-- **Rupiah hanya nilai tampilan**, dikonversi dari `currency_rates.IDR` di
-  `/api/status` (kurs referensi, bukan kurs bank). Pembukuan tetap USD.
-- **Baris refund itu normal**: new-api memotong estimasi di awal request lalu
-  mengembalikan selisihnya bila panggilan gagal.
-- **Kolom `model` pada log bisa berisi label**, bukan nama model, untuk baris
-  non-pemakaian. Nomor `type` new-api (`model/log.go`) dan labelnya:
-
-  | `type` | Arti | Label di output |
-  |---|---|---|
-  | `1` | topup saldo | `isi saldo` |
-  | `2` | pemakaian | nama model |
-  | `3` | operasi kelola | `kelola` |
-  | `4` | sistem | `sistem` |
-  | `5` | error (mis. `status_code=499, context canceled`) | `error` |
-  | `6` | refund | `refund` |
-  | `7` | login | `login` |
-
-  Perhatikan `5` = **error** dan `6` = **refund** — mudah tertukar, dan baris
-  error memang sering muncul walau request terlihat sukses di sisi klien.
-- **Kegagalan handler datang sebagai HTTP 200.** Endpoint `/api/*` new-api
-  (`common.ApiError`) membalas `{"success":false,"message":...}` dengan status
-  `200`. Script memeriksa envelope itu; tanpa itu, log yang ditolak terbaca
-  seolah-olah "belum ada log".
-
-## Pengembangan
-
-```bash
-python3 test_aihub_usage.py
-```
-
-Test suite menjalankan CLI terhadap `mock_gateway.py` yang meniru response asli
-new-api (bentuk `/v1/dashboard/billing/*` yang memakai cent, key unlimited vs
-terbatas, log semua tipe, ringkasan token + rincian per model, arsip lokal
-termasuk dedupe/scope/fallback, gzip, paralelisme (puncak request bersamaan),
-tidak ada endpoint diambil dua kali, body error 401, envelope `success:false`,
-sampai isolasi config/env). **Tidak memakai credit asli dan tidak butuh API
-key** — config **dan arsip** asli sengaja diabaikan lewat
-`AIHUB_CONFIG`/`AIHUB_DB` agar hasilnya sama di mesin siapa pun dan arsip asli
-Anda tidak tersentuh.
-
-```bash
-AIHUB_CLI=/path/lain/aihub-usage python3 test_aihub_usage.py   # uji versi lain
-```
-
-Status: **101/101 passed**.
-
-Struktur repo:
-
-```
-aihub-usage            script utama (executable, di-symlink ke ~/.local/bin)
-install.sh             pemasangan symlink dan uninstall
-test_aihub_usage.py    test suite (101 kasus, tanpa API key asli)
-mock_gateway.py        mock new-api untuk keperluan tes
-README.md              dokumen ini
-```
-
-## Keamanan
-
-- API key tidak pernah ditulis ke output maupun log; yang tampil hanya nama key.
-- **Header `Authorization` tidak diteruskan ke host lain.** Redirect 3xx ke
-  host/skema berbeda diikuti tanpa header itu, dan redirect `https`→`http`
-  ditolak sama sekali — supaya endpoint/proxy tidak bisa memancing key keluar.
-- `save-key` menerima key dari `$AIHUB_API_KEY` atau `--key-file`, tidak wajib
-  `--key`. Ini penting karena argumen `--key` terlihat oleh `ps` di mesin
-  multiuser dan tersimpan di riwayat shell.
-- `save-key`/`store` menulis `~/.config/aihub/config.json` dengan mode `0600`
-  (`fchmod` sebelum menulis, jadi file lama yang longgar tidak pernah sempat
-  dibaca saat key baru ditulis).
-- Arsip log lokal (bila diaktifkan) dibuat dengan mode `0600` — termasuk bila
-  file-nya sudah ada dengan mode longgar, yang akan dirapikan — di dalam direktori
-  `0700`. Isinya hanya kolom yang perlu dihitung: id log, waktu, tipe, nama model,
-  token, quota, durasi. **Tidak** menyimpan `ip`, `username`, atau isi request.
-  Baris di-scope dengan SHA-256 API key — file tidak berisi key itu sendiri.
-- Jangan commit API key. Bila ragu, gunakan `--key-file` di luar repo atau
-  environment variable.
-- Script hanya membaca data dari gateway; tidak ada operasi tulis, tidak ada
-  pembuatan/penghapusan key. Arsip lokal murni di sisi Anda dan bisa dihapus kapan
-  saja (`rm -rf ~/.local/share/aihub-usage`).
-- **`--json` meneruskan payload gateway apa adanya** (objek `/api/usage/token/`
-  dan setiap baris `/api/log/token`, termasuk field yang tidak ditampilkan di mode
-  teks). Kalau hasilnya dialihkan ke file, perlakukan file itu seperti data
-  sensitif — sama seperti contoh `aihub-usage --json > saldo.json` di README ini.
+| Dokumen | Isi |
+|---|---|
+| [Cara kerja & catatan angka](docs/cara-kerja.md) | Endpoint yang dipakai, kenapa cepat, arti tiap angka, tipe log |
+| [Arsip log lokal](docs/arsip-lokal.md) | Cara mengaktifkan, mode, dedupe, dan batasnya |
+| [Keamanan](docs/keamanan.md) | Penanganan API key, izin file, isi arsip |
+| [Pengembangan](docs/pengembangan.md) | Test suite, struktur repo, mode mock gateway |
 
 ## Lisensi
 
