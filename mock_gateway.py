@@ -22,10 +22,16 @@ TOKEN_LIMITED = {"code": True, "message": "ok", "data": {
     "unlimited_quota": False, "model_limits": {"gpt-5.5": True, "claude-sonnet-5.5": True},
     "model_limits_enabled": True, "expires_at": 1791458302}}
 LOGS = {"success": True, "message": "", "data": [
+    {"id": 9002, "type": 5, "created_at": 1791458402, "token_name": "prod-hermes",
+     "model_name": "", "quota": 0, "prompt_tokens": 0, "completion_tokens": 0,
+     "use_time": 2, "group": "auto", "content": "upstream timeout"},
     {"id": 9001, "type": 2, "created_at": 1791458302, "token_name": "prod-hermes",
      "model_name": "gpt-5.5", "quota": 12_500, "prompt_tokens": 1200,
      "completion_tokens": 340, "use_time": 4, "is_stream": True, "group": "auto"},
-    {"id": 9000, "type": 6, "created_at": 1791454702, "token_name": "prod-hermes",
+    {"id": 9000, "type": 2, "created_at": 1791454702, "token_name": "prod-hermes",
+     "model_name": "deepseek-v4.1-flash", "quota": 5_000, "prompt_tokens": 800,
+     "completion_tokens": 100, "use_time": 3, "group": "auto"},
+    {"id": 8999, "type": 6, "created_at": 1791454702, "token_name": "prod-hermes",
      "model_name": "", "quota": 0, "prompt_tokens": 0, "completion_tokens": 0,
      "use_time": 1, "group": "auto"}]}
 MODELS = {'object': 'list', 'data': [{'id': 'gpt-5.5'}, {'id': ''}, {'id': 'deepseek-v4.1-flash'}]}
@@ -35,6 +41,13 @@ STATUS = {"data": {"system_name": "metranet AI", "version": "2576fe9",
                    "docs_link": "/docs/"}}
 
 LIMITED = False
+# --errlog: /api/log/token membalas HTTP 200 + {"success":false} seperti
+# common.ApiError new-api saat handler gagal.
+ERRLOG = False
+# --emptylogs: /api/log/token sukses tapi belum ada baris log
+EMPTY_LOGS = False
+# --emptychoices: /v1/chat/completions tanpa entri `choices`
+EMPTY_CHOICES = False
 
 
 class H(BaseHTTPRequestHandler):
@@ -63,6 +76,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/usage/token/":
             return self._send(TOKEN_LIMITED if LIMITED else TOKEN)
         if p == "/api/log/token":
+            if ERRLOG:
+                return self._send({"success": False,
+                                   "message": "获取日志失败"}, 200)
+            if EMPTY_LOGS:
+                return self._send({"success": True, "message": "", "data":[]})
             return self._send(LOGS)
         if p == "/v1/models":
             return self._send(MODELS)
@@ -74,9 +92,12 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n) or b"")
         p = self.path.split("?")[0]
         if p == "/v1/chat/completions":
+            choices = []
+            if not EMPTY_CHOICES:
+                choices = [{"index": 0,
+                            "message": {"role": "assistant", "content": "hi"}}]
             return self._send({"id": "chatcmpl-1", "model": body.get("model"),
-                               "choices": [{"index": 0, "message": {"role": "assistant",
-                                            "content": "hi"}}],
+                               "choices": choices,
                                "usage": {"prompt_tokens": 3, "completion_tokens": 1}})
         if p == "/v1/messages":
             return self._send({"id": "msg_1", "model": body.get("model"),
@@ -88,5 +109,8 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     import sys
     LIMITED = "--limited" in sys.argv
+    ERRLOG = "--errlog" in sys.argv
+    EMPTY_LOGS = "--emptylogs" in sys.argv
+    EMPTY_CHOICES = "--emptychoices" in sys.argv
     port = int(sys.argv[1]) if sys.argv[1:2] and sys.argv[1].isdigit() else 8791
     HTTPServer(("127.0.0.1", port), H).serve_forever()

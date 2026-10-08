@@ -65,8 +65,10 @@ else
 fi
 
 # --- verifikasi -------------------------------------------------------------
-if ! "$TARGET" status >/dev/null 2>&1; then
-  info "peringatan: '$TARGET status' gagal jalan. Cek manual: $TARGET status"
+# offline saja: cukup membuktikan shebang + interpreter + argparse jalan.
+# (memanggil `status` akan menembak jaringan dan gagal palsu saat offline)
+if ! "$TARGET" --help >/dev/null 2>&1; then
+  info "peringatan: '$TARGET --help' gagal jalan. Cek manual: $TARGET --help"
 fi
 
 # --- cek PATH ---------------------------------------------------------------

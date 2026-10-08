@@ -2,12 +2,12 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#persyaratan)
-[![Tests](https://img.shields.io/badge/tests-32%20passed-brightgreen)](#pengembangan)
+[![Tests](https://img.shields.io/badge/tests-63%20passed-brightgreen)](#pengembangan)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#persyaratan)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-CLI untuk melihat **sisa credit (saldo), pemakaian, dan log request** dari API key
-pada gateway [Scala AI Gateway by Metranet](https://aihub.metranet.co.id).
+CLI untuk melihat **sisa credit (saldo), pemakaian token, dan log request** dari
+API key pada gateway [Scala AI Gateway by Metranet](https://aihub.metranet.co.id).
 
 Gateway tersebut dibangun di atas [new-api](https://github.com/QuantumNous/new-api),
 sehingga seluruh data diambil dari endpoint resminya — **tanpa scraping HTML** dan
@@ -31,10 +31,62 @@ CREDIT AKUN
 API KEY INI
   nama          : prod-hermes
   limit key     : unlimited (ikut saldo akun)
-  terpakai key  : $1.23
+  terpakai key  : $1.23  (617,250 quota)
   sisa kuota key: unlimited
   kadaluarsa    : tidak ada
   batas model   : semua model
+  catatan       : key unlimited — gateway melaporkan total_granted & total_available = 0; patokan saldo ada di baris SISA CREDIT.
+
+PEMAKAIAN TOKEN
+  dasar hitung  : 4 log terakhir (2026-10-08 17:18 s/d 2026-10-08 18:20)
+  request       : 2
+  token masuk   : 2,000
+  token keluar  : 440
+  TOTAL TOKEN   : 2,440
+  rata-rata     : 1,220 token/request
+  biaya jendela : $0.0350  (Rp 630)
+  biaya 1jt tok : $14.34
+  catatan       : hanya log yang dikirim gateway (new-api membatasi daftar log per key), bukan total seumur hidup key.
+```
+
+Angka dolar selalu disertai nilai **quota** aslinya dalam tanda kurung, jadi bisa
+langsung dicocokkan dengan response gateway tanpa baris terpisah. Untuk key dengan
+kuota terbatas, ketiga angka itu terisi penuh:
+
+```console
+$ aihub-usage key
+
+API KEY INI
+  nama          : kontraktor-1
+  limit key     : $5.00  (2,500,000 quota)
+  terpakai key  : $2.00  (1,000,000 quota)
+  sisa kuota key: $3.00  (1,500,000 quota)
+  kadaluarsa    : 2026-10-08 12:18
+  batas model   : gpt-5.5
+```
+
+`aihub-usage tokens` menambah rincian per model:
+
+```console
+$ aihub-usage tokens
+
+PEMAKAIAN TOKEN
+  dasar hitung  : 4 log terakhir (2026-10-08 17:18 s/d 2026-10-08 18:20)
+  request       : 2
+  token masuk   : 2,000
+  token keluar  : 440
+  TOTAL TOKEN   : 2,440
+  rata-rata     : 1,220 token/request
+  biaya jendela : $0.0350  (Rp 630)
+  biaya 1jt tok : $14.34
+
+  PER MODEL
+  model                           req        masuk       keluar        total      biaya
+  gpt-5.5                           1        1,200          340        1,540    $0.0250
+  deepseek-v4.1-flash               1          800          100          900    $0.0100
+
+  kuota terpakai: 617,250 quota = $1.23
+  sisa kuota    : 41,258,875 quota = $82.52
 ```
 
 ---
@@ -55,7 +107,10 @@ API KEY INI
 ## Fitur
 
 - **Sisa credit akun** — total credit, terpakai, dan sisa (USD + estimasi Rupiah).
-- **Kuota per API key** — status unlimited, batas, kadaluarsa, dan batas model.
+- **Pemakaian token** — token masuk/keluar/total, rata-rata per request, biaya per
+  juta token, dan rincian per model (`tokens`).
+- **Kuota per API key** — status unlimited, batas, kadaluarsa, batas model, plus
+  nilai **quota** asli di samping setiap angka dolar.
 - **Log request** — waktu, model, token masuk/keluar, biaya, dan durasi per panggilan.
 - **Daftar model** — model yang bisa dipakai oleh key tersebut.
 - **Probe** — kirim satu request kecil untuk memastikan key benar-benar jalan.
@@ -104,10 +159,11 @@ aihub-usage [command] [options]
 
 | Command | Keterangan |
 |---|---|
-| `all` *(default)* | Status gateway + credit akun + info API key |
+| `all` *(default)* | Status gateway + credit akun + info API key + ringkasan token |
 | `balance` | Hanya sisa credit akun |
 | `key` | Hanya kuota dan pemakaian API key ini |
 | `logs` | Log request terakhir lewat key ini (`-n` untuk jumlah baris) |
+| `tokens` | Pemakaian dalam satuan token + rincian per model |
 | `models` | Daftar model yang bisa dipakai key ini |
 | `status` | Info gateway: versi, kurs, satuan quota (tanpa API key) |
 | `probe` | Kirim 1 request kecil untuk menguji key |
@@ -119,10 +175,10 @@ aihub-usage [command] [options]
 | `--key-file PATH` | Baca API key dari baris pertama file |
 | `--base-url URL` | Override base URL (default `https://aihub.metranet.co.id`) |
 | `--json` | Output JSON untuk diproses script |
-| `-n, --limit N` | Jumlah log yang ditampilkan (default `10`) |
-| `--warn-below USD` | Keluar dengan exit code `3` bila sisa credit di bawah nilai ini |
+| `-n, --limit N` | Jumlah log yang ditampilkan (default `10`; `0` = tanpa baris) |
+| `--warn-below USD` | Keluar dengan exit code `3` bila sisa credit di bawah nilai ini (saldo akun ikut diambil walau command-nya bukan `balance`) |
 | `--model NAMA` | Model untuk `probe` |
-| `--max-tokens N` | `max_tokens` saat `probe` (default `1`) |
+| `--max-tokens N` | `max_tokens` saat `probe` (default `1`, minimal `1`) |
 | `--anthropic` | `probe` lewat `/v1/messages` (protokol Anthropic) |
 
 Contoh:
@@ -130,10 +186,13 @@ Contoh:
 ```bash
 aihub-usage                        # ringkasan lengkap
 aihub-usage balance                # cek saldo saja
+aihub-usage tokens                 # pemakaian token + rincian per model
 aihub-usage logs -n 20             # 20 request terakhir
 aihub-usage models                 # model yang tersedia untuk key ini
 aihub-usage status                 # info gateway (tidak butuh API key)
 aihub-usage probe --anthropic      # tes key lewat /v1/messages
+aihub-usage probe --json           # hasil probe sebagai JSON
+aihub-usage key --warn-below 5     # cek kuota key + peringatan saldo
 ```
 
 > [!TIP]
@@ -178,17 +237,27 @@ Exit code:
 | Code | Arti |
 |---|---|
 | `0` | Normal |
-| `1` | Gagal — key ditolak, error jaringan, atau key belum diset |
+| `1` | Gagal — key ditolak, error jaringan, key belum diset, atau bagian yang diminta gagal diambil (mis. `logs` ditolak gateway) |
+| `2` | Argumen salah (mis. `-n -1`, `--max-tokens 0`, command tidak dikenal) |
 | `3` | Sisa credit di bawah `--warn-below` |
 
-Contoh pemakaian di cron — kirim notifikasi bila saldo menipis:
+Bagian yang gagal tidak pernah dilaporkan sebagai "tidak ada data": gateway new-api
+membalas kegagalan handler dengan **HTTP 200 + `{"success":false}`**, dan script
+memperlakukannya sebagai error (exit `1`), bukan sebagai hasil kosong.
+
+Contoh pemakaian di cron — kirim notifikasi bila saldo menipis, tanpa salah
+menganggap error jaringan sebagai saldo habis:
 
 ```bash
 #!/usr/bin/env bash
-set -euo pipefail
-if ! aihub-usage balance --warn-below 5 >/dev/null; then
-  aihub-usage balance | mail -s "Saldo aihub menipis" admin@example.com
-fi
+set -uo pipefail
+aihub-usage balance --warn-below 5 >/dev/null
+rc=$?
+case $rc in
+  3) aihub-usage balance | mail -s "Saldo aihub menipis" admin@example.com ;;
+  0) : ;;
+  *) echo "aihub-usage gagal (exit $rc)" >&2 ;;
+esac
 ```
 
 ## Cara kerja & catatan angka
@@ -200,6 +269,7 @@ Semua data diambil dari endpoint new-api yang memang sudah ada:
 | Total & sisa credit akun | `GET /v1/dashboard/billing/subscription` + `GET /v1/dashboard/billing/usage` | API key |
 | Kuota & pemakaian key | `GET /api/usage/token/` | API key |
 | Log request key ini | `GET /api/log/token` | API key |
+| Pemakaian token (masuk/keluar, per model) | `GET /api/log/token` (dijumlahkan dari kolom `prompt_tokens`/`completion_tokens`) | API key |
 | Daftar model | `GET /v1/models` | API key |
 | Info gateway (kurs, satuan) | `GET /api/status` | publik |
 | Probe 1 request | `POST /v1/chat/completions` atau `POST /v1/messages` | API key |
@@ -207,14 +277,27 @@ Semua data diambil dari endpoint new-api yang memang sudah ada:
 Beberapa detail yang mudah salah baca:
 
 - **Satuan internal gateway adalah `quota`.** `500.000 quota = $1`, dan nilainya
-  diambil dinamis dari `/api/status` — bukan hardcode.
+  diambil dinamis dari `/api/status` — bukan hardcode. Setiap angka kuota key
+  (`limit key`, `terpakai key`, `sisa kuota key`) ditampilkan sebagai dolar
+  **beserta nilai quota aslinya dalam tanda kurung**, jadi bisa dicocokkan
+  langsung dengan response `/api/usage/token` tanpa baris terpisah.
+- **Angka token adalah jendela log, bukan total seumur hidup key.** Tidak ada
+  endpoint new-api yang memberi agregat token untuk sebuah API key, jadi token
+  dijumlahkan dari `/api/log/token` — dan endpoint itu mengembalikan paling banyak
+  `MaxRecentItems` baris terakhir (default **1000** di new-api). Karena itu bagian
+  `PEMAKAIAN TOKEN` selalu menyebut **dasar hitung** (jumlah log + rentang
+  waktunya), dan hanya baris `type=2` (pemakaian) yang dihitung: baris error/refund
+  bernilai 0 token dan tidak dihitung sebagai request.
+- **`biaya 1jt tok` adalah biaya rata-rata per 1 juta token** pada jendela itu
+  (campuran model), bukan tarif resmi satu model.
 - **`total_usage` dari endpoint billing satuannya cent**, sedangkan
   `hard_limit_usd` satuannya dolar. Jadi
   `sisa = hard_limit_usd − total_usage / 100`.
 - **`hard_limit_usd` bukan "batas yang boleh dipakai"**, melainkan total credit
   yang pernah diberikan (terpakai + sisa).
 - **Key dengan kuota unlimited** melaporkan `total_granted`/`total_available`
-  bernilai `0` dan `unlimited_quota:true`. Itu bukan berarti saldo kosong.
+  bernilai `0` dan `unlimited_quota:true`. Itu bukan berarti saldo kosong — script
+  menuliskan baris `catatan` untuk menjelaskannya dan mengarahkan ke `SISA CREDIT`.
 - **Statistik bisa per-key, bukan per-akun**, tergantung konfigurasi gateway.
   Bila angka billing berbeda dari `/api/usage/token/`, script menandainya dengan
   baris `catatan` — bukan diam-diam memilih salah satu.
@@ -222,6 +305,25 @@ Beberapa detail yang mudah salah baca:
   `/api/status` (kurs referensi, bukan kurs bank). Pembukuan tetap USD.
 - **Baris refund itu normal**: new-api memotong estimasi di awal request lalu
   mengembalikan selisihnya bila panggilan gagal.
+- **Kolom `model` pada log bisa berisi label**, bukan nama model, untuk baris
+  non-pemakaian. Nomor `type` new-api (`model/log.go`) dan labelnya:
+
+  | `type` | Arti | Label di output |
+  |---|---|---|
+  | `1` | topup saldo | `isi saldo` |
+  | `2` | pemakaian | nama model |
+  | `3` | operasi kelola | `kelola` |
+  | `4` | sistem | `sistem` |
+  | `5` | error (mis. `status_code=499, context canceled`) | `error` |
+  | `6` | refund | `refund` |
+  | `7` | login | `login` |
+
+  Perhatikan `5` = **error** dan `6` = **refund** — mudah tertukar, dan baris
+  error memang sering muncul walau request terlihat sukses di sisi klien.
+- **Kegagalan handler datang sebagai HTTP 200.** Endpoint `/api/*` new-api
+  (`common.ApiError`) membalas `{"success":false,"message":...}` dengan status
+  `200`. Script memeriksa envelope itu; tanpa itu, log yang ditolak terbaca
+  seolah-olah "belum ada log".
 
 ## Pengembangan
 
@@ -231,22 +333,23 @@ python3 test_aihub_usage.py
 
 Test suite menjalankan CLI terhadap `mock_gateway.py` yang meniru response asli
 new-api (bentuk `/v1/dashboard/billing/*` yang memakai cent, key unlimited vs
-terbatas, log, body error 401, sampai isolasi config/env). **Tidak memakai credit
-asli dan tidak butuh API key** — config asli sengaja diabaikan lewat `AIHUB_CONFIG`
+terbatas, log semua tipe, ringkasan token + rincian per model, body error 401,
+envelope `success:false`, sampai isolasi config/env). **Tidak memakai credit asli
+dan tidak butuh API key** — config asli sengaja diabaikan lewat `AIHUB_CONFIG`
 agar hasilnya sama di mesin siapa pun.
 
 ```bash
 AIHUB_CLI=/path/lain/aihub-usage python3 test_aihub_usage.py   # uji versi lain
 ```
 
-Status: **32/32 passed**.
+Status: **63/63 passed**.
 
 Struktur repo:
 
 ```
 aihub-usage            script utama (executable, di-symlink ke ~/.local/bin)
 install.sh             pemasangan symlink dan uninstall
-test_aihub_usage.py    test suite (32 kasus, tanpa API key asli)
+test_aihub_usage.py    test suite (63 kasus, tanpa API key asli)
 mock_gateway.py        mock new-api untuk keperluan tes
 README.md              dokumen ini
 ```
