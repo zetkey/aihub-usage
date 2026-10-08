@@ -41,6 +41,8 @@ STATUS = {"data": {"system_name": "metranet AI", "version": "2576fe9",
                    "docs_link": "/docs/"}}
 
 LIMITED = False
+# --anykey: terima bearer token apa pun (untuk menguji scope arsip per key)
+ANYKEY = False
 # --errlog: /api/log/token membalas HTTP 200 + {"success":false} seperti
 # common.ApiError new-api saat handler gagal.
 ERRLOG = False
@@ -67,7 +69,7 @@ class H(BaseHTTPRequestHandler):
         p = self.path.split("?")[0]
         if p == "/api/status":
             return self._send(STATUS)
-        if auth != "Bearer " + KEY:
+        if auth != "Bearer " + KEY and not ANYKEY:
             return self._send({"error": {"message": "Invalid token", "type": "new_api_error"}}, 401)
         if p in ("/v1/dashboard/billing/subscription", "/dashboard/billing/subscription"):
             return self._send(SUB)
@@ -109,6 +111,7 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     import sys
     LIMITED = "--limited" in sys.argv
+    ANYKEY = "--anykey" in sys.argv
     ERRLOG = "--errlog" in sys.argv
     EMPTY_LOGS = "--emptylogs" in sys.argv
     EMPTY_CHOICES = "--emptychoices" in sys.argv

@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#persyaratan)
-[![Tests](https://img.shields.io/badge/tests-63%20passed-brightgreen)](#pengembangan)
+[![Tests](https://img.shields.io/badge/tests-88%20passed-brightgreen)](#pengembangan)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#persyaratan)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -39,6 +39,7 @@ API KEY INI
 
 PEMAKAIAN TOKEN
   dasar hitung  : 4 log terakhir (2026-10-08 17:18 s/d 2026-10-08 18:20)
+  mode          : API SAJA — arsip lokal tidak aktif, token hanya dihitung dari jendela log yang dikirim gateway
   request       : 2
   token masuk   : 2,000
   token keluar  : 440
@@ -109,6 +110,9 @@ PEMAKAIAN TOKEN
 - **Sisa credit akun** — total credit, terpakai, dan sisa (USD + estimasi Rupiah).
 - **Pemakaian token** — token masuk/keluar/total, rata-rata per request, biaya per
   juta token, dan rincian per model (`tokens`).
+- **Arsip log lokal (opsional, default OFF)** — mengakumulasi log antar-run agar
+  perhitungan token melampaui batas 1000 log terakhir milik gateway. Aktifkan
+  lewat `local_store` di config; output selalu menyebut mode yang dipakai.
 - **Kuota per API key** — status unlimited, batas, kadaluarsa, batas model, plus
   nilai **quota** asli di samping setiap angka dolar.
 - **Log request** — waktu, model, token masuk/keluar, biaya, dan durasi per panggilan.
@@ -168,6 +172,7 @@ aihub-usage [command] [options]
 | `status` | Info gateway: versi, kurs, satuan quota (tanpa API key) |
 | `probe` | Kirim 1 request kecil untuk menguji key |
 | `save-key` | Simpan API key ke file config |
+| `store [on\|off\|status]` | Aktifkan/nonaktifkan arsip log lokal (tanpa perlu API key) |
 
 | Opsi | Keterangan |
 |---|---|
@@ -179,6 +184,8 @@ aihub-usage [command] [options]
 | `--warn-below USD` | Keluar dengan exit code `3` bila sisa credit di bawah nilai ini (saldo akun ikut diambil walau command-nya bukan `balance`) |
 | `--model NAMA` | Model untuk `probe` |
 | `--max-tokens N` | `max_tokens` saat `probe` (default `1`, minimal `1`) |
+| `--store` | Aktifkan arsip log lokal untuk run ini (default: ikut `local_store` di config) |
+| `--no-store` | Paksa hitung hanya dari jendela log API (menang atas config/env) |
 | `--anthropic` | `probe` lewat `/v1/messages` (protokol Anthropic) |
 
 Contoh:
@@ -223,7 +230,78 @@ arahkan saja ke host new-api lain.
 | `AIHUB_API_KEY` | API key |
 | `AIHUB_BASE_URL` | Base URL gateway |
 | `AIHUB_CONFIG` | Lokasi file config (default `~/.config/aihub/config.json`) |
+| `AIHUB_STORE` | `1`/`true` untuk mengaktifkan arsip log lokal |
+| `AIHUB_DB` | Lokasi arsip log lokal (default `~/.local/share/aihub-usage/logs.db`) |
 | `AIHUB_CLI` | Path script untuk test suite |
+
+### Arsip log lokal (opsional)
+
+`/api/log/token` hanya mengembalikan **1000 baris terakhir** (nilai `MaxRecentItems`
+di new-api, di-hardcode) dan tidak punya parameter paginasi. Jadi angka token dari
+API saja selalu terpotong. Arsip lokal mengakumulasi log antar-run sehingga
+cakupannya bertambah setiap kali CLI dijalankan.
+
+**Default OFF** — tidak ada file yang dibuat sampai Anda mengaktifkannya:
+
+```bash
+aihub-usage store on              # aktifkan permanen (local_store=true)
+aihub-usage store off             # nonaktifkan lagi
+aihub-usage store                 # lihat status (aktif/nonaktif, path config & arsip)
+aihub-usage tokens --store        # sekali jalan saja, tanpa mengubah config
+AIHUB_STORE=1 aihub-usage tokens  # lewat environment
+```
+
+`store on`/`store off` mengubah `~/.config/aihub/config.json` dan **tidak perlu
+API key** — jadi tidak perlu menempelkan `--key` hanya untuk mematikan fitur ini.
+Setelah `store off`, perintah biasa langsung kembali menghitung dari API saja tanpa
+`--no-store`:
+
+```console
+$ aihub-usage store
+Arsip log lokal: nonaktif (default)
+  config : /Users/anda/.config/aihub/config.json
+  db     : /Users/anda/.local/share/aihub-usage/logs.db (belum dibuat)
+  flag   : local_store tidak diset
+  ubah   : aihub-usage store on  |  aihub-usage store off
+```
+
+`store off` tidak menghapus arsip yang sudah terkumpul — script memberi tahu
+lokasinya supaya Anda bisa menghapusnya sendiri bila mau.
+
+Isi `~/.config/aihub/config.json` setelah diaktifkan:
+
+```json
+{
+  "api_key": "sk-...",
+  "local_store":true
+}
+```
+
+Setiap kali arsip dipakai, output menyebut mode-nya secara eksplisit — aktif
+menghitung gabungan arsip + API, nonaktif menghitung dari jendela API saja:
+
+```console
+$ aihub-usage tokens --store
+
+PEMAKAIAN TOKEN
+  dasar hitung  : 1,204 log di arsip lokal (2026-10-01 09:12 s/d 2026-10-08 17:56)
+  run ini       : 87 log baru diarsipkan
+  mode          : ARSIP LOKAL AKTIF — token dihitung dari gabungan log tersimpan + log yang baru diambil dari API
+  arsip         : /Users/anda/.local/share/aihub-usage/logs.db
+  ...
+
+$ aihub-usage tokens
+
+PEMAKAIAN TOKEN
+  dasar hitung  : 533 log terakhir (2026-10-08 08:38 s/d 2026-10-08 17:56)
+  mode          : API SAJA — arsip lokal tidak aktif, token hanya dihitung dari jendela log yang dikirim gateway
+  ...
+```
+
+Dedupe memakai `(key_hash, id)`, jadi menjalankan CLI berkali-kali tidak
+menghitung ganda. Kalau antar-run ada log yang terlewat (kalah cepat dari batas
+1000 log), script mencetak baris `PERINGATAN` — jalankan lebih sering, mis. lewat
+cron, supaya celahnya makin kecil.
 
 ## Integrasi (script & cron)
 
@@ -281,13 +359,18 @@ Beberapa detail yang mudah salah baca:
   (`limit key`, `terpakai key`, `sisa kuota key`) ditampilkan sebagai dolar
   **beserta nilai quota aslinya dalam tanda kurung**, jadi bisa dicocokkan
   langsung dengan response `/api/usage/token` tanpa baris terpisah.
-- **Angka token adalah jendela log, bukan total seumur hidup key.** Tidak ada
-  endpoint new-api yang memberi agregat token untuk sebuah API key, jadi token
-  dijumlahkan dari `/api/log/token` — dan endpoint itu mengembalikan paling banyak
-  `MaxRecentItems` baris terakhir (default **1000** di new-api). Karena itu bagian
-  `PEMAKAIAN TOKEN` selalu menyebut **dasar hitung** (jumlah log + rentang
-  waktunya), dan hanya baris `type=2` (pemakaian) yang dihitung: baris error/refund
+- **Angka token dari API adalah jendela log, bukan total seumur hidup key.**
+  Tidak ada endpoint new-api yang memberi agregat token untuk sebuah API key, jadi
+  token dijumlahkan dari `/api/log/token` — dan endpoint itu mengembalikan paling
+  banyak `MaxRecentItems` baris terakhir (default **1000** di new-api, hardcode,
+  tanpa paginasi). Bagian `PEMAKAIAN TOKEN` selalu menyebut **dasar hitung** dan
+  **mode**-nya. Hanya baris `type=2` (pemakaian) yang dihitung: baris error/refund
   bernilai 0 token dan tidak dihitung sebagai request.
+- **Arsip lokal mengatasi batas 1000 itu, tapi tidak menghapus batasnya.**
+  Cakupannya hanya seluas yang sempat terarsip: log yang muncul dan hilang di
+  antara dua run (lebih dari 1000 request) tetap tidak terekam. Karena itu run
+  berkala lebih penting daripada run sesekali, dan `PERINGATAN` muncul saat celah
+  itu terdeteksi.
 - **`biaya 1jt tok` adalah biaya rata-rata per 1 juta token** pada jendela itu
   (campuran model), bukan tarif resmi satu model.
 - **`total_usage` dari endpoint billing satuannya cent**, sedangkan
@@ -333,23 +416,24 @@ python3 test_aihub_usage.py
 
 Test suite menjalankan CLI terhadap `mock_gateway.py` yang meniru response asli
 new-api (bentuk `/v1/dashboard/billing/*` yang memakai cent, key unlimited vs
-terbatas, log semua tipe, ringkasan token + rincian per model, body error 401,
-envelope `success:false`, sampai isolasi config/env). **Tidak memakai credit asli
-dan tidak butuh API key** — config asli sengaja diabaikan lewat `AIHUB_CONFIG`
-agar hasilnya sama di mesin siapa pun.
+terbatas, log semua tipe, ringkasan token + rincian per model, arsip lokal
+termasuk dedupe/scope/fallback, body error 401, envelope `success:false`, sampai
+isolasi config/env). **Tidak memakai credit asli dan tidak butuh API key** —
+config **dan arsip** asli sengaja diabaikan lewat `AIHUB_CONFIG`/`AIHUB_DB` agar
+hasilnya sama di mesin siapa pun dan arsip asli Anda tidak tersentuh.
 
 ```bash
 AIHUB_CLI=/path/lain/aihub-usage python3 test_aihub_usage.py   # uji versi lain
 ```
 
-Status: **63/63 passed**.
+Status: **88/88 passed**.
 
 Struktur repo:
 
 ```
 aihub-usage            script utama (executable, di-symlink ke ~/.local/bin)
 install.sh             pemasangan symlink dan uninstall
-test_aihub_usage.py    test suite (63 kasus, tanpa API key asli)
+test_aihub_usage.py    test suite (88 kasus, tanpa API key asli)
 mock_gateway.py        mock new-api untuk keperluan tes
 README.md              dokumen ini
 ```
@@ -358,10 +442,15 @@ README.md              dokumen ini
 
 - API key tidak pernah ditulis ke output maupun log; yang tampil hanya nama key.
 - `save-key` menulis `~/.config/aihub/config.json` dengan mode `0600`.
+- Arsip log lokal (bila diaktifkan) dibuat dengan mode `0600` dan hanya menyimpan
+  kolom yang perlu dihitung: id log, waktu, tipe, nama model, token, quota, durasi.
+  **Tidak** menyimpan `ip`, `username`, atau isi request. Baris di-scope dengan
+  SHA-256 API key — file tidak berisi key itu sendiri.
 - Jangan commit API key. Bila ragu, gunakan `--key-file` di luar repo atau
   environment variable.
 - Script hanya membaca data dari gateway; tidak ada operasi tulis, tidak ada
-  pembuatan/penghapusan key.
+  pembuatan/penghapusan key. Arsip lokal murni di sisi Anda dan bisa dihapus kapan
+  saja (`rm -rf ~/.local/share/aihub-usage`).
 
 ## Lisensi
 

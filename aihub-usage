@@ -14,11 +14,14 @@ Gateway ini berbasis new-api (QuantumNous), jadi endpoint yang dipakai:
   GET /v1/models                             daftar model             [auth: API key]
   POST /v1/chat/completions | /v1/messages   probe 1 token (opsional)
 
-Pemakaian dalam satuan token tidak punya endpoint agregat di new-api: angkanya
-dijumlahkan dari /api/log/token (kolom prompt_tokens/completion_tokens, hanya
-baris type=2). Endpoint itu mengembalikan paling banyak MaxRecentItems baris
-(default 1000), jadi hasilnya ringkasan jendela log — bukan total seumur hidup
-key. Bagian PEMAKAIAN TOKEN selalu menyebut dasar hitungnya.
+Pemakaian dalam satuan token tidak punya endpoint agregat di new-api, dan
+/api/log/token mengembalikan paling banyak MaxRecentItems baris terakhir (1000,
+hardcode) tanpa paginasi. Ada opsi arsip log lokal (sqlite) yang mengakumulasi
+log antar-run supaya cakupannya melampaui 1000 log itu — TAPI default OFF:
+aktifkan dengan "local_store":true di config.json (atau $AIHUB_STORE=1, atau
+--store sekali jalan). Arsip di-scope dengan SHA-256 API key (bukan key-nya) dan
+hanya menyimpan kolom yang perlu dihitung; lokasinya ~/.local/share/aihub-usage/
+logs.db (override $AIHUB_DB).
 
 Konversi: 500.000 quota = $1 (diambil dinamis dari /api/status).
 
@@ -31,10 +34,12 @@ error, bukan sebagai data kosong.
 """
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
 import signal
+import sqlite3
 import stat
 import sys
 import urllib.error
@@ -45,6 +50,7 @@ from datetime import datetime, timezone, timedelta
 DEFAULT_BASE = "https://aihub.metranet.co.id"
 DEFAULT_QUOTA_PER_UNIT = 500_000  # fallback; nilai asli diambil dari /api/status
 CONFIG_PATH = os.path.expanduser(os.environ.get("AIHUB_CONFIG", "~/.config/aihub/config.json"))
+DB_PATH = os.path.expanduser(os.environ.get("AIHUB_DB", "~/.local/share/aihub-usage/logs.db"))
 TIMEOUT = 30
 WIB = timezone(timedelta(hours=7))
 
@@ -356,6 +362,144 @@ def summarize_tokens(logs, qpu):
     }
 
 
+# --------------------------------------------------------------- store lokal
+#
+# /api/log/token hanya mengembalikan MaxRecentItems baris terakhir (1000 di
+# new-api, hardcode) dan tidak punya parameter paginasi, jadi angka token dari
+# jendela itu akan selalu terpotong. Arsip lokal (sqlite) bisa mengakumulasi log
+# antar-run sehingga cakupannya lebih lengkap.
+#
+# Arsip ini DEFAULT OFF — tidak ada file yang dibuat sampai diaktifkan lewat
+# "local_store":true di config.json, $AIHUB_STORE=1, atau --store.
+#
+# Isi arsip sengaja minimal (tanpa ip/username/content) dan di-scope dengan
+# SHA-256 API key, bukan key-nya, supaya file lokal tidak membocorkan kredensial.
+
+TRUTHY = ("1", "true", "yes", "on")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS logs (
+    key_hash          TEXT    NOT NULL,
+    id                INTEGER NOT NULL,
+    created_at        INTEGER NOT NULL DEFAULT 0,
+    type              INTEGER NOT NULL DEFAULT 0,
+    model_name        TEXT    NOT NULL DEFAULT '',
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    quota             INTEGER NOT NULL DEFAULT 0,
+    use_time          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (key_hash, id)
+);
+CREATE INDEX IF NOT EXISTS idx_logs_key_time ON logs (key_hash, created_at);
+"""
+
+def scope_of(key):
+    """Identitas arsip untuk sebuah API key: SHA-256, bukan key itu sendiri."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+def truthy(v):
+    """True untuk 'true'/'1'/'yes'/'on' (dari env atau config.json)."""
+    if isinstance(v, bool):
+        return v
+    return v is not None and str(v).strip().lower() in TRUTHY
+
+def store_enabled(args):
+    """Arsip lokal default OFF. Urutan: --no-store > --store > $AIHUB_STORE >
+    `local_store` di config.json > off."""
+    if args.no_store:
+        return False
+    if args.store:
+        return True
+    if truthy(os.environ.get("AIHUB_STORE")):
+        return True
+    return truthy(load_config().get("local_store"))
+
+def open_store(path=None):
+    """Buka arsip log lokal. Mengembalikan (conn, error_message)."""
+    path = path or DB_PATH
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fresh = not os.path.exists(path)
+        conn = sqlite3.connect(path)
+        if fresh:
+            # arsip berisi jejak pemakaian; samakan dengan config (0600)
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        conn.executescript(SCHEMA)
+        conn.commit()
+        return conn, None
+    except (OSError, sqlite3.Error) as e:
+        return None, "%s (%s)" % (e, path)
+
+def store_logs(conn, scope, logs):
+    """Arsipkan log baru. Mengembalikan (jumlah_baru, ada_gap).
+
+    Dedupe lewat PRIMARY KEY (key_hash, id) + INSERT OR IGNORE, jadi menjalankan
+    CLI berkali-kali tidak menghitung ganda. `ada_gap` benar bila log tertua yang
+    baru diambil lebih baru dari log terbaru yang sudah diarsipkan — artinya ada
+    request di antaranya yang tidak pernah terlihat (kalah cepat dari 1000 log).
+    """
+    rows = [(scope, to_int(l.get("id")), to_int(l.get("created_at")),
+             to_int(l.get("type")), str(l.get("model_name") or ""),
+             to_int(l.get("prompt_tokens")), to_int(l.get("completion_tokens")),
+             to_int(l.get("quota")), to_int(l.get("use_time")))
+            for l in logs if l.get("id") is not None]
+    if not rows:
+        return 0, False
+    prev_max, prev_count = conn.execute(
+        "SELECT COALESCE(MAX(created_at), 0), COUNT(*) FROM logs WHERE key_hash = ?",
+        (scope,)).fetchone()
+    times = [r[2] for r in rows if r[2]]
+    oldest = min(times) if times else 0
+    before = conn.total_changes
+    conn.executemany(
+        "INSERT OR IGNORE INTO logs (key_hash, id, created_at, type, model_name,"
+        " prompt_tokens, completion_tokens, quota, use_time)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    conn.commit()
+    added = conn.total_changes - before
+    gap = bool(prev_count and oldest and oldest > prev_max)
+    return added, gap
+
+def store_summary(conn, scope, qpu, added=0, gap=False):
+    """Ringkasan token dari arsip lokal; bentuknya sama dengan summarize_tokens."""
+    stored, first_at, last_at = conn.execute(
+        "SELECT COUNT(*), COALESCE(MIN(created_at), 0), COALESCE(MAX(created_at), 0)"
+        " FROM logs WHERE key_hash = ?", (scope,)).fetchone()
+    requests, prompt, completion, quota = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(prompt_tokens), 0),"
+        " COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(quota), 0)"
+        " FROM logs WHERE key_hash = ? AND type = 2", (scope,)).fetchone()
+    by_model = [{"model": name or "(tanpa model)", "requests": n,
+                 "prompt_tokens": p, "completion_tokens": c, "quota": q}
+                for name, n, p, c, q in conn.execute(
+                    "SELECT model_name, COUNT(*), COALESCE(SUM(prompt_tokens), 0),"
+                    " COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(quota), 0)"
+                    " FROM logs WHERE key_hash = ? AND type = 2"
+                    " GROUP BY model_name ORDER BY SUM(quota) DESC, model_name",
+                    (scope,))]
+    total_tokens = prompt + completion
+    cost = quota_to_usd(quota, qpu)
+    return {
+        "source": "arsip lokal",
+        "stored_logs": stored,
+        "added": added,
+        "gap": gap,
+        "requests": requests,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total_tokens,
+        "avg_tokens_per_request": (total_tokens / requests) if requests else 0.0,
+        "quota": quota,
+        "cost_usd": cost,
+        "cost_per_million_tokens": (cost / total_tokens * 1_000_000) if total_tokens else 0.0,
+        "first_at": first_at,
+        "last_at": last_at,
+        "by_model": by_model,
+    }
+
+
 # -------------------------------------------------------------------- commands
 
 
@@ -415,6 +559,23 @@ def collect(args, base, key):
             out["logs_error"] = e.message
     if "logs" in out:
         out["tokens"] = summarize_tokens(out["logs"], qpu)
+        # Arsip lokal (default off, lihat store_enabled): arsipkan dulu, lalu
+        # hitung dari arsip supaya angka melampaui batas 1000 log terakhir milik
+        # gateway. Kalau arsip tidak bisa dipakai, tetap laporkan angka jendela
+        # beserta peringatannya.
+        if store_enabled(args):
+            conn, err = open_store()
+            if conn is None:
+                out["store_error"] = err
+            else:
+                try:
+                    scope = scope_of(key)
+                    added, gap = store_logs(conn, scope, out["logs"])
+                    out["tokens"] = store_summary(conn, scope, qpu, added, gap)
+                except sqlite3.Error as e:
+                    out["store_error"] = str(e)
+                finally:
+                    conn.close()
     elif args.command in ("all", "tokens"):
         # untuk `logs` kegagalannya sudah dilaporkan bagian LOG, tidak perlu dobel
         out["tokens_error"] = out["logs_error"]
@@ -521,17 +682,36 @@ def print_report(d, args):
         elif not tw["requests"]:
             print("  belum ada log pemakaian.")
         else:
-            print("  dasar hitung  : %s log terakhir (%s s/d %s)" % (
-                format_tokens(tw["window_logs"]),
-                fmt_ts(tw["first_at"]), fmt_ts(tw["last_at"])))
+            local = tw.get("source") == "arsip lokal"
+            if local:
+                print("  dasar hitung  : %s log di arsip lokal (%s s/d %s)" % (
+                    format_tokens(tw["stored_logs"]),
+                    fmt_ts(tw["first_at"]), fmt_ts(tw["last_at"])))
+                print("  run ini       : %s log baru diarsipkan" %
+                      format_tokens(tw["added"]))
+                if tw.get("gap"):
+                    print("  PERINGATAN    : ada log yang terlewat antar-run (kalah cepat "
+                          "dari batas 1000 log gateway) — jalankan lebih sering.")
+            else:
+                print("  dasar hitung  : %s log terakhir (%s s/d %s)" % (
+                    format_tokens(tw["window_logs"]),
+                    fmt_ts(tw["first_at"]), fmt_ts(tw["last_at"])))
+            if local:
+                print("  mode          : ARSIP LOKAL AKTIF — token dihitung dari "
+                      "gabungan log tersimpan + log yang baru diambil dari API")
+                print("  arsip         : %s" % DB_PATH)
+            else:
+                print("  mode          : API SAJA — arsip lokal tidak aktif, token "
+                      "hanya dihitung dari jendela log yang dikirim gateway")
             print("  request       : %s" % format_tokens(tw["requests"]))
             print("  token masuk   : %s" % format_tokens(tw["prompt_tokens"]))
             print("  token keluar  : %s" % format_tokens(tw["completion_tokens"]))
             print("  TOTAL TOKEN   : %s" % format_tokens(tw["total_tokens"]))
             print("  rata-rata     : %s token/request" % format_tokens(
                 round(tw["avg_tokens_per_request"])))
-            print("  biaya jendela : %s%s" % (usd(tw["cost_usd"]),
-                                             rupiah(tw["cost_usd"])))
+            print("  biaya %-8s: %s%s" % ("arsip" if local else "jendela",
+                                            usd(tw["cost_usd"]),
+                                            rupiah(tw["cost_usd"])))
             if tw["total_tokens"]:
                 print("  biaya 1jt tok : %s" % usd(tw["cost_per_million_tokens"]))
             if args.command == "tokens":
@@ -556,8 +736,15 @@ def print_report(d, args):
                         format_quota(tok.get("total_available")),
                         usd(quota_to_usd(tok.get("total_available"), qpu))))
                 print()
-            print("  catatan       : hanya log yang dikirim gateway (new-api membatasi "
-                  "daftar log per key), bukan total seumur hidup key.")
+            if local:
+                print("  catatan       : dijumlahkan dari arsip lokal (%s); cakupannya "
+                      "seluas yang sempat terarsip, bukan total seumur hidup key." % DB_PATH)
+            else:
+                print("  catatan       : hanya log yang dikirim gateway (new-api membatasi "
+                      "daftar log per key), bukan total seumur hidup key.")
+        if d.get("store_error"):
+            print("  catatan       : arsip lokal tidak bisa dipakai (%s); angka di atas "
+                  "hanya jendela log dari gateway." % d["store_error"])
 
     if "models" in d or d.get("models_error"):
         print("\nMODEL")
@@ -635,21 +822,63 @@ def cmd_probe(args, base, key):
     print("  jawab  : %r" % result["content"])
 
 
-def cmd_save_key(args, base, key):
+def write_config(cfg):
+    """Tulis config.json mode 0600 (dibuat langsung 0600, bukan chmod belakangan)."""
     cfg_dir = os.path.dirname(CONFIG_PATH)
     if cfg_dir:
         os.makedirs(cfg_dir, exist_ok=True)
-    cfg = load_config()
-    cfg["api_key"] = key
-    if args.base_url:
-        cfg["base_url"] = base
-    # dibuat langsung dengan mode 0600 supaya key tidak pernah sempat terbaca
-    # pihak lain (umask default bisa 0644 sebelum chmod).
+    # dibuat langsung dengan mode 0600 supaya isinya tidak pernah sempat terbaca
+    # pihak lain (umumnya umask default 0644 sebelum chmod).
     fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f, indent=2)
     os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # rapikan file lama
+
+def cmd_save_key(args, base, key):
+    cfg = load_config()
+    cfg["api_key"] = key
+    if args.base_url:
+        cfg["base_url"] = base
+    # `save-key --store` / `--no-store` sekalian mengatur arsip lokal.
+    if args.store:
+        cfg["local_store"] = True
+    elif args.no_store:
+        cfg.pop("local_store", None)
+    write_config(cfg)
     print("API key disimpan di %s (mode 0600)." % CONFIG_PATH)
+    if args.store:
+        print("Arsip log lokal: AKTIF (local_store=true). "
+              "Nonaktifkan dengan: aihub-usage store off")
+    elif args.no_store:
+        print("Arsip log lokal: nonaktif (local_store dihapus dari config).")
+
+def cmd_store(args):
+    """`store [on|off|status]` — atur arsip log lokal tanpa perlu API key."""
+    action = args.action or "status"
+    cfg = load_config()
+    active = truthy(cfg.get("local_store"))
+
+    if action == "status":
+        print("Arsip log lokal: %s" % ("AKTIF" if active else "nonaktif (default)"))
+        print("  config : %s%s" % (CONFIG_PATH, "" if os.path.exists(CONFIG_PATH) else " (belum ada)"))
+        print("  db     : %s%s" % (DB_PATH, "" if os.path.exists(DB_PATH) else " (belum dibuat)"))
+        print("  flag   : %s" % ("local_store=true" if active else "local_store tidak diset"))
+        print("  ubah   : aihub-usage store on  |  aihub-usage store off")
+        return 0
+
+    if action == "on":
+        cfg["local_store"] = True
+        write_config(cfg)
+        print("Arsip log lokal: AKTIF (local_store=true di %s)." % CONFIG_PATH)
+        print("Token akan dihitung dari gabungan arsip + API pada run berikutnya.")
+    else:  # off
+        cfg.pop("local_store", None)
+        write_config(cfg)
+        print("Arsip log lokal: nonaktif (local_store dihapus dari %s)." % CONFIG_PATH)
+        if os.path.exists(DB_PATH):
+            print("Arsip yang sudah ada tetap di %s (tidak dihapus)." % DB_PATH)
+            print("Hapus manual bila tidak diperlukan: rm -f %s" % DB_PATH)
+    return 0
 
 
 def nonneg_int(s):
@@ -681,12 +910,17 @@ def main():
                "  aihub-usage balance --warn-below 5   # exit code 3 kalau sisa < $5\n"
                "  aihub-usage logs -n 20               # 20 request terakhir key ini\n"
                "  aihub-usage models                   # daftar model\n"
+               "  aihub-usage store on                 # aktifkan arsip log lokal\n"
+               "  aihub-usage store off                # nonaktifkan arsip log lokal\n"
                "  aihub-usage probe --anthropic        # tes 1 request via /v1/messages\n"
                "  aihub-usage --json                   # output JSON untuk script lain\n")
     p.add_argument("command", nargs="?",
                    choices=["all", "balance", "key", "logs", "tokens", "models",
-                            "status", "probe", "save-key"],
+                            "status", "probe", "save-key", "store"],
                    default="all")
+    p.add_argument("action", nargs="?",
+                   choices=["on", "off", "status"],
+                   help="aksi untuk `store` (default: status)")
     p.add_argument("--key", help="API key (sk-...); default $AIHUB_API_KEY / file config")
     p.add_argument("--key-file", help="baca API key dari baris pertama file")
     p.add_argument("--base-url", help="override base URL (default %s)" % DEFAULT_BASE)
@@ -700,10 +934,19 @@ def main():
     p.add_argument("--model", help="model untuk probe")
     p.add_argument("--max-tokens", type=positive_int, default=1,
                    help="max_tokens probe (default 1)")
+    p.add_argument("--store", action="store_true",
+                   help="aktifkan arsip log lokal untuk run ini (default: "
+                        "mengikuti \"local_store\" di config.json / $AIHUB_STORE)")
+    p.add_argument("--no-store", action="store_true",
+                   help="paksa lewati arsip log lokal (hitung hanya dari jendela "
+                        "log gateway)")
     p.add_argument("--anthropic", action="store_true", help="probe lewat /v1/messages")
     args = p.parse_args()
 
     base = resolve_base(args)
+
+    if args.command == "store":
+        return cmd_store(args)
 
     if args.command == "save-key":
         if not args.key:

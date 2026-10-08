@@ -34,12 +34,15 @@ CLI = os.environ.get("AIHUB_CLI", _default_cli())
 KEY = "sk-testkey123"
 # config yang tidak pernah dibuat -> tes tidak terpengaruh ~/.config/aihub/config.json asli
 ISOLATED_CONFIG = os.path.join(HERE, ".test_no_config.json")
+# arsip log tes; tanpa ini tes akan menulis ke arsip asli milik user
+ISOLATED_DB = os.path.join(HERE, ".test_no_db.sqlite")
 
 
 def clean_env(**overrides):
     env = {k: v for k, v in os.environ.items()
-           if k not in ("AIHUB_API_KEY", "AIHUB_BASE_URL", "AIHUB_CONFIG")}
+           if k not in ("AIHUB_API_KEY", "AIHUB_BASE_URL", "AIHUB_CONFIG", "AIHUB_DB")}
     env["AIHUB_CONFIG"] = ISOLATED_CONFIG
+    env["AIHUB_DB"] = ISOLATED_DB
     env.update(overrides)
     return env
 
@@ -55,7 +58,7 @@ def free_port():
 
 
 def start_mock(port, limited=False, errlog=False, empty_choices=False,
-               empty_logs=False):
+               empty_logs=False, anykey=False):
     args = [sys.executable, MOCK, str(port)]
     if limited:
         args.append("--limited")
@@ -65,6 +68,8 @@ def start_mock(port, limited=False, errlog=False, empty_choices=False,
         args.append("--emptychoices")
     if empty_logs:
         args.append("--emptylogs")
+    if anykey:
+        args.append("--anykey")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
@@ -76,9 +81,16 @@ def start_mock(port, limited=False, errlog=False, empty_choices=False,
     raise RuntimeError("mock gagal start di port %d" % port)
 
 
-def run(base, *args):
+def test_db(base):
+    """Arsip per-mock-server: server berbeda tidak saling mencemari arsip."""
+    return os.path.join(HERE, ".test_db_%s.sqlite" % base.rsplit(":", 1)[-1])
+
+
+def run(base, *args, env=None, db=None):
+    """Jalankan CLI dengan arsip terisolasi dari arsip asli milik user."""
     cmd = [sys.executable, CLI, "--base-url", base, "--key", KEY] + list(args)
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                       env=env or clean_env(AIHUB_DB=db or test_db(base)))
     return p.returncode, p.stdout, p.stderr
 
 def run_env(base, env, *args):
@@ -90,7 +102,8 @@ def run_env(base, env, *args):
 
 def run_badkey(base, *args):
     cmd = [sys.executable, CLI, "--base-url", base, "--key", "sk-wrong"] + list(args)
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                       env=clean_env())
     return p.returncode, p.stdout, p.stderr
 
 
@@ -100,18 +113,20 @@ def case(name, ok, detail=""):
 
 
 def main():
-    p1, p2, p3, p4, p5 = (free_port(), free_port(), free_port(), free_port(),
-                          free_port())
+    p1, p2, p3, p4, p5, p6 = (free_port(), free_port(), free_port(), free_port(),
+                              free_port(), free_port())
     m1 = start_mock(p1)
     m2 = start_mock(p2, limited=True)
     m3 = start_mock(p3, errlog=True)
     m4 = start_mock(p4, empty_choices=True)
     m5 = start_mock(p5, empty_logs=True)
+    m6 = start_mock(p6, anykey=True)
     b1 = "http://127.0.0.1:%d" % p1
     b2 = "http://127.0.0.1:%d" % p2
     b3 = "http://127.0.0.1:%d" % p3
     b4 = "http://127.0.0.1:%d" % p4
     b5 = "http://127.0.0.1:%d" % p5
+    b6 = "http://127.0.0.1:%d" % p6
     try:
         # --- status (endpoint publik) -------------------------------------
         rc, out, err = run(b1, "status")
@@ -225,12 +240,188 @@ def main():
         case("logs: -n negatif ditolak argparse (exit 2)",
              rc == 2 and "negatif" in err, "%s / %s" % (rc, err.strip()))
 
+        # --- arsip lokal (default OFF) --------------------------------------
+        adb = os.path.join(HERE, ".test_archive.sqlite")
+        for f in (adb, os.path.join(HERE, ".test_empty.sqlite")):
+            if os.path.exists(f):
+                os.remove(f)
+        try:
+            # default: tidak menyentuh arsip sama sekali
+            rc, out, err = run(b1, "tokens", db=adb)
+            case("arsip default OFF: pakai jendela gateway, tanpa file arsip",
+                 rc == 0 and "log terakhir" in out and not os.path.exists(adb),
+                 "%s / exists=%s" % (out[-120:], os.path.exists(adb)))
+
+            # --store mengaktifkan untuk run ini
+            rc, out, err = run(b1, "tokens", "--store", db=adb)
+            case("arsip --store: dasar hitung = arsip lokal + jumlah log baru",
+                 rc == 0 and "di arsip lokal" in out and "4 log baru diarsipkan" in out,
+                 out)
+            case("arsip --store: file dibuat mode 0600",
+                 os.path.exists(adb)
+                 and oct(stat.S_IMODE(os.stat(adb).st_mode)) == "0o600",
+                 oct(stat.S_IMODE(os.stat(adb).st_mode)) if os.path.exists(adb) else "?")
+
+            rc, out, err = run(b1, "tokens", "--store", db=adb)
+            case("arsip: run kedua tidak menambah baris (dedupe by id)",
+                 rc == 0 and "0 log baru diarsipkan" in out, out)
+            case("arsip: total token tetap (tidak dihitung ganda)",
+                 "TOTAL TOKEN   : 2,440" in out, out)
+
+            # env AIHUB_STORE=1 juga mengaktifkan
+            rc, out, err = run(b1, "tokens", env=clean_env(AIHUB_DB=adb,
+                                                           AIHUB_STORE="1"))
+            case("arsip: $AIHUB_STORE=1 mengaktifkan tanpa flag",
+                 rc == 0 and "di arsip lokal" in out, out)
+
+            # key berbeda -> arsip terpisah (scope SHA-256), bukan tercampur.
+            # b6 menerima key apa pun; kalau scope-nya bocor, key kedua akan
+            # melaporkan 0 log baru karena id log-nya sama.
+            p = subprocess.run([sys.executable, CLI, "--base-url", b6, "tokens"],
+                               capture_output=True, text=True, timeout=60,
+                               env=clean_env(AIHUB_DB=adb, AIHUB_STORE="1",
+                                             AIHUB_API_KEY="sk-key-lain"))
+            case("arsip: key lain punya arsip sendiri (scope key_hash)",
+                 p.returncode == 0 and "4 log baru diarsipkan" in p.stdout
+                 and "8 log di arsip" not in p.stdout, p.stdout[-300:])
+
+            # --no-store menang atas $AIHUB_STORE
+            rc, out, err = run(b1, "tokens", "--no-store",
+                               env=clean_env(AIHUB_DB=adb, AIHUB_STORE="1"))
+            case("--no-store menang atas $AIHUB_STORE",
+                 rc == 0 and "log terakhir" in out and "di arsip lokal" not in out, out)
+
+            # server tanpa log: tetap pesan jelas walau arsip aktif
+            rc, out, err = run(b5, "tokens", "--store",
+                               db=os.path.join(HERE, ".test_empty.sqlite"))
+            case("arsip aktif + tanpa log: 'belum ada log pemakaian'",
+                 rc == 0 and "belum ada log pemakaian" in out, out)
+
+            # arsip tidak bisa dibuka -> fallback jendela + catatan
+            broken = os.path.join(HERE, ".test_broken_dir")
+            os.makedirs(broken, exist_ok=True)
+            rc, out, err = run(b1, "tokens", "--store", db=broken)
+            case("arsip tidak bisa dibuka: fallback jendela + catatan, exit 0",
+                 rc == 0 and "log terakhir" in out and "arsip lokal tidak bisa dipakai" in out,
+                 out)
+        finally:
+            for f in (adb, os.path.join(HERE, ".test_empty.sqlite")):
+                if os.path.exists(f):
+                    os.remove(f)
+            shutil.rmtree(os.path.join(HERE, ".test_broken_dir"), ignore_errors=True)
+
+        # --- local_store lewat config.json ----------------------------------
+        cfg_store = os.path.join(HERE, ".test_store_config.json")
+        with open(cfg_store, "w") as f:
+            json.dump({"api_key": KEY, "local_store": True}, f)
+        cdb = os.path.join(HERE, ".test_cfg_store.sqlite")
+        try:
+            rc, out, err = run(b1, "tokens",
+                               env=clean_env(AIHUB_CONFIG=cfg_store, AIHUB_DB=cdb))
+            case("config local_store=true: arsip aktif tanpa flag",
+                 rc == 0 and "di arsip lokal" in out, out)
+
+            rc, out, err = run(b1, "tokens", "--no-store",
+                               env=clean_env(AIHUB_CONFIG=cfg_store, AIHUB_DB=cdb))
+            case("--no-store menang atas config local_store=true",
+                 rc == 0 and "log terakhir" in out and "di arsip lokal" not in out, out)
+
+            p = subprocess.run([sys.executable, CLI, "--key", KEY, "save-key",
+                                "--store", "--base-url", b1], capture_output=True,
+                               text=True, timeout=60,
+                               env=clean_env(AIHUB_CONFIG=cfg_store))
+            saved = json.load(open(cfg_store))
+            case("save-key --store: local_store=true ditulis ke config",
+                 p.returncode == 0 and saved.get("local_store") is True
+                 and "AKTIF" in p.stdout, "%s / %s" % (p.stdout.strip(), saved))
+
+            p = subprocess.run([sys.executable, CLI, "--key", KEY, "save-key",
+                                "--no-store", "--base-url", b1], capture_output=True,
+                               text=True, timeout=60,
+                               env=clean_env(AIHUB_CONFIG=cfg_store))
+            saved = json.load(open(cfg_store))
+            case("save-key --no-store: local_store dihapus dari config",
+                 p.returncode == 0 and "local_store" not in saved, saved)
+        finally:
+            for f in (cfg_store, cdb):
+                if os.path.exists(f):
+                    os.remove(f)
+
+        # --- command `store` (tanpa perlu API key) --------------------------
+        scfg = os.path.join(HERE, ".test_store_cmd.json")
+        sdb = os.path.join(HERE, ".test_store_cmd.sqlite")
+        for f in (scfg, sdb):
+            if os.path.exists(f):
+                os.remove(f)
+        try:
+            def store(*a, **kw):
+                return run_env(b1, clean_env(AIHUB_CONFIG=scfg, AIHUB_DB=sdb,
+                                             AIHUB_API_KEY=KEY), *a, **kw)
+
+            rc, out, err = store("store")
+            case("store: status awal = nonaktif (default off)",
+                 rc == 0 and "nonaktif (default)" in out, out)
+
+            rc, out, err = store("store", "on")
+            case("store on: local_store=true ditulis ke config",
+                 rc == 0 and json.load(open(scfg)).get("local_store") is True, out)
+
+            rc, out, err = store("store")
+            case("store: status setelah on = AKTIF", rc == 0 and "AKTIF" in out, out)
+
+            # tanpa flag apa pun, arsip kini aktif karena config
+            rc, out, err = store("tokens")
+            case("store on: run berikutnya otomatis pakai arsip",
+                 rc == 0 and "di arsip lokal" in out, out)
+
+            rc, out, err = store("store", "off")
+            case("store off: local_store dihapus dari config",
+                 rc == 0 and "local_store" not in json.load(open(scfg)), out)
+
+            rc, out, err = store("tokens")
+            case("store off: tidak perlu --no-store lagi, langsung API saja",
+                 rc == 0 and "log terakhir" in out and "di arsip lokal" not in out, out)
+
+            # key di config lama harus tetap utuh saat toggle
+            with open(scfg, "w") as f:
+                json.dump({"api_key": KEY, "base_url": b1}, f)
+            rc, out, err = store("store", "on")
+            saved = json.load(open(scfg))
+            case("store on: api_key & base_url tidak hilang",
+                 rc == 0 and saved.get("api_key") == KEY
+                 and saved.get("base_url") == b1, saved)
+            case("store: config tetap mode 0600",
+                 oct(stat.S_IMODE(os.stat(scfg).st_mode)) == "0o600",
+                 oct(stat.S_IMODE(os.stat(scfg).st_mode)))
+
+            # tanpa API key sama sekali tetap jalan
+            p = subprocess.run([sys.executable, CLI, "store", "status"],
+                               capture_output=True, text=True, timeout=60,
+                               env=clean_env(AIHUB_CONFIG=scfg, AIHUB_DB=sdb))
+            case("store status: jalan tanpa API key",
+                 p.returncode == 0 and "Arsip log lokal" in p.stdout, p.stderr[:200])
+
+            p = subprocess.run([sys.executable, CLI, "store", "off"],
+                               capture_output=True, text=True, timeout=60,
+                               env=clean_env(AIHUB_CONFIG=scfg, AIHUB_DB=sdb))
+            case("store off: jalan tanpa API key",
+                 p.returncode == 0 and "local_store" not in json.load(open(scfg)),
+                 p.stderr[:200])
+
+            rc, out, err = store("store", "ngawur")
+            case("store: aksi tidak dikenal ditolak (exit 2)", rc == 2, rc)
+        finally:
+            for f in (scfg, sdb):
+                if os.path.exists(f):
+                    os.remove(f)
+
         # --- stdout ditutup lebih awal (mis. `aihub-usage tokens | head`) ----
         pipe = " ".join(shlex.quote(x) for x in
                         [sys.executable, CLI, "--base-url", b1, "--key", KEY,
                          "tokens"]) + " | head -3"
         p = subprocess.run(pipe, shell=True, capture_output=True, text=True,
-                           timeout=60)
+                           timeout=60,
+                           env=clean_env(AIHUB_DB=test_db(b1)))
         case("output dipotong `head`: bersih, tanpa traceback BrokenPipe",
              "Traceback" not in p.stderr and "BrokenPipe" not in p.stderr,
              p.stderr.strip()[-200:])
@@ -353,7 +544,8 @@ def main():
         try:
             p = subprocess.run([sys.executable, CLI, "--key-file", kf,
                                 "--base-url", b1, "balance"],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60,
+                               env=clean_env(AIHUB_DB=test_db(b1)))
             case("--key-file: baris pertama (komentar dilewati) dipakai",
                  p.returncode == 0 and "SISA CREDIT" in p.stdout, p.stdout[-150:])
         finally:
@@ -397,8 +589,12 @@ def main():
         finally:
             shutil.rmtree(os.path.join(HERE, ".test_nested"), ignore_errors=True)
     finally:
-        for m in (m1, m2, m3, m4, m5):
+        for m in (m1, m2, m3, m4, m5, m6):
             m.kill()
+        for base in (b1, b2, b3, b4, b5, b6):
+            f = test_db(base)
+            if os.path.exists(f):
+                os.remove(f)
 
     failed = [r for r in results if not r[1]]
     print("\n%d/%d PASS" % (len(results) - len(failed), len(results)))
