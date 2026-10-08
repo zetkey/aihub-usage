@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#persyaratan)
-[![Tests](https://img.shields.io/badge/tests-88%20passed-brightgreen)](#pengembangan)
+[![Tests](https://img.shields.io/badge/tests-96%20passed-brightgreen)](#pengembangan)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#persyaratan)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -426,14 +426,14 @@ hasilnya sama di mesin siapa pun dan arsip asli Anda tidak tersentuh.
 AIHUB_CLI=/path/lain/aihub-usage python3 test_aihub_usage.py   # uji versi lain
 ```
 
-Status: **88/88 passed**.
+Status: **96/96 passed**.
 
 Struktur repo:
 
 ```
 aihub-usage            script utama (executable, di-symlink ke ~/.local/bin)
 install.sh             pemasangan symlink dan uninstall
-test_aihub_usage.py    test suite (88 kasus, tanpa API key asli)
+test_aihub_usage.py    test suite (96 kasus, tanpa API key asli)
 mock_gateway.py        mock new-api untuk keperluan tes
 README.md              dokumen ini
 ```
@@ -441,16 +441,29 @@ README.md              dokumen ini
 ## Keamanan
 
 - API key tidak pernah ditulis ke output maupun log; yang tampil hanya nama key.
-- `save-key` menulis `~/.config/aihub/config.json` dengan mode `0600`.
-- Arsip log lokal (bila diaktifkan) dibuat dengan mode `0600` dan hanya menyimpan
-  kolom yang perlu dihitung: id log, waktu, tipe, nama model, token, quota, durasi.
-  **Tidak** menyimpan `ip`, `username`, atau isi request. Baris di-scope dengan
-  SHA-256 API key — file tidak berisi key itu sendiri.
+- **Header `Authorization` tidak diteruskan ke host lain.** Redirect 3xx ke
+  host/skema berbeda diikuti tanpa header itu, dan redirect `https`→`http`
+  ditolak sama sekali — supaya endpoint/proxy tidak bisa memancing key keluar.
+- `save-key` menerima key dari `$AIHUB_API_KEY` atau `--key-file`, tidak wajib
+  `--key`. Ini penting karena argumen `--key` terlihat oleh `ps` di mesin
+  multiuser dan tersimpan di riwayat shell.
+- `save-key`/`store` menulis `~/.config/aihub/config.json` dengan mode `0600`
+  (`fchmod` sebelum menulis, jadi file lama yang longgar tidak pernah sempat
+  dibaca saat key baru ditulis).
+- Arsip log lokal (bila diaktifkan) dibuat dengan mode `0600` — termasuk bila
+  file-nya sudah ada dengan mode longgar, yang akan dirapikan — di dalam direktori
+  `0700`. Isinya hanya kolom yang perlu dihitung: id log, waktu, tipe, nama model,
+  token, quota, durasi. **Tidak** menyimpan `ip`, `username`, atau isi request.
+  Baris di-scope dengan SHA-256 API key — file tidak berisi key itu sendiri.
 - Jangan commit API key. Bila ragu, gunakan `--key-file` di luar repo atau
   environment variable.
 - Script hanya membaca data dari gateway; tidak ada operasi tulis, tidak ada
   pembuatan/penghapusan key. Arsip lokal murni di sisi Anda dan bisa dihapus kapan
   saja (`rm -rf ~/.local/share/aihub-usage`).
+- **`--json` meneruskan payload gateway apa adanya** (objek `/api/usage/token/`
+  dan setiap baris `/api/log/token`, termasuk field yang tidak ditampilkan di mode
+  teks). Kalau hasilnya dialihkan ke file, perlakukan file itu seperti data
+  sensitif — sama seperti contoh `aihub-usage --json > saldo.json` di README ini.
 
 ## Lisensi
 

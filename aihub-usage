@@ -88,6 +88,31 @@ class ApiError(Exception):
 # --------------------------------------------------------------------------- io
 
 
+class SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Ikuti redirect, tapi jangan bocorkan API key ke host/skema lain.
+
+    urllib bawaan menyalin header Authorization apa adanya saat mengikuti 3xx,
+    jadi endpoint/proxy yang membalas redirect bisa menerima key kita. Di sini
+    header itu dilepas bila host atau skema tujuan berbeda, dan redirect
+    https->http ditolak (return None -> urllib melempar HTTPError 3xx, yang
+    diperlakukan sebagai error oleh api()).
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        old = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(newurl)
+        if old.scheme == "https" and target.scheme == "http":
+            return None
+        if (old.scheme, old.netloc) != (target.scheme, target.netloc):
+            new.remove_header("Authorization")
+        return new
+
+
+OPENER = urllib.request.build_opener(SafeRedirect)
+
 def http(method, url, key=None, body=None, headers=None, timeout=TIMEOUT):
     """Return (status, parsed_json_or_text). Tidak pernah mencetak key."""
     hdrs = {"Accept": "application/json", "User-Agent": "aihub-usage/1.0"}
@@ -105,7 +130,7 @@ def http(method, url, key=None, body=None, headers=None, timeout=TIMEOUT):
         # --base-url / $AIHUB_BASE_URL yang bukan URL (mis. "foo" tanpa skema)
         raise ApiError(0, "base URL tidak valid (%s): %s" % (e, url))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with OPENER.open(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8", "replace")
             status = r.status
     except urllib.error.HTTPError as e:
@@ -197,6 +222,10 @@ def api(base, path, key, method="GET", body=None, headers=None):
         else:
             msg = str(data)[:200]
         raise ApiError(status, "HTTP %s: %s" % (status, msg))
+    if 300 <= status < 400:
+        # redirect yang tidak diikuti (mis. https->http) — jangan diteruskan
+        # sebagai "data", karena body-nya halaman redirect, bukan JSON.
+        raise ApiError(status, "HTTP %s: redirect tidak diikuti (%s)" % (status, path))
     if isinstance(data, dict) and isinstance(data.get("error"), dict) and data["error"].get("message"):
         raise ApiError(status, data["error"]["message"])
     # new-api membalas error handler dengan HTTP 200 + {"success":false, ...}
@@ -346,7 +375,14 @@ def summarize_tokens(logs, qpu):
     total_tokens = prompt + completion
     cost = quota_to_usd(quota, qpu)
     return {
+        # kontrak JSON seragam di kedua mode: kunci arsip selalu ada (None/0/false
+        # bila arsip nonaktif) supaya script pemanggil tidak KeyError hanya karena
+        # `local_store` diubah.
+        "source": "api",
         "window_logs": len(logs),
+        "stored_logs": None,
+        "added": 0,
+        "gap": False,
         "requests": len(consume),
         "prompt_tokens": prompt,
         "completion_tokens": completion,
@@ -420,12 +456,15 @@ def open_store(path=None):
     try:
         parent = os.path.dirname(path)
         if parent:
-            os.makedirs(parent, exist_ok=True)
-        fresh = not os.path.exists(path)
+            # 0700: direktori tidak perlu bisa dibaca user lain
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        # File dibuat lebih dulu dengan mode 0600 supaya sqlite tidak sempat
+        # membuatnya 0644 (umask default) sebelum di-chmod. chmod tetap dipanggil
+        # untuk merapikan file lama yang mode-nya longgar.
+        if not os.path.exists(path):
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
         conn = sqlite3.connect(path)
-        if fresh:
-            # arsip berisi jejak pemakaian; samakan dengan config (0600)
-            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         conn.executescript(SCHEMA)
         conn.commit()
         return conn, None
@@ -462,7 +501,7 @@ def store_logs(conn, scope, logs):
     gap = bool(prev_count and oldest and oldest > prev_max)
     return added, gap
 
-def store_summary(conn, scope, qpu, added=0, gap=False):
+def store_summary(conn, scope, qpu, window_logs, added=0, gap=False):
     """Ringkasan token dari arsip lokal; bentuknya sama dengan summarize_tokens."""
     stored, first_at, last_at = conn.execute(
         "SELECT COUNT(*), COALESCE(MIN(created_at), 0), COALESCE(MAX(created_at), 0)"
@@ -483,6 +522,7 @@ def store_summary(conn, scope, qpu, added=0, gap=False):
     cost = quota_to_usd(quota, qpu)
     return {
         "source": "arsip lokal",
+        "window_logs": window_logs,
         "stored_logs": stored,
         "added": added,
         "gap": gap,
@@ -571,7 +611,8 @@ def collect(args, base, key):
                 try:
                     scope = scope_of(key)
                     added, gap = store_logs(conn, scope, out["logs"])
-                    out["tokens"] = store_summary(conn, scope, qpu, added, gap)
+                    out["tokens"] = store_summary(conn, scope, qpu,
+                                                  len(out["logs"]), added, gap)
                 except sqlite3.Error as e:
                     out["store_error"] = str(e)
                 finally:
@@ -827,12 +868,18 @@ def write_config(cfg):
     cfg_dir = os.path.dirname(CONFIG_PATH)
     if cfg_dir:
         os.makedirs(cfg_dir, exist_ok=True)
-    # dibuat langsung dengan mode 0600 supaya isinya tidak pernah sempat terbaca
-    # pihak lain (umumnya umask default 0644 sebelum chmod).
+    # fchmod SEBELUM menulis: mode pada os.open hanya berlaku saat file dibuat,
+    # jadi file lama yang longgar akan tetap longgar sampai chmod di bawah —
+    # cukup lama untuk key baru terlihat pihak lain. chmod tetap dipanggil untuk
+    # merapikan path (mis. file yang diganti proses lain).
     fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass  # mis. filesystem tanpa dukungan chmod; chmod di bawah jadi cadangan
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f, indent=2)
-    os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # rapikan file lama
+    os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)
 
 def cmd_save_key(args, base, key):
     cfg = load_config()
@@ -921,7 +968,9 @@ def main():
     p.add_argument("action", nargs="?",
                    choices=["on", "off", "status"],
                    help="aksi untuk `store` (default: status)")
-    p.add_argument("--key", help="API key (sk-...); default $AIHUB_API_KEY / file config")
+    p.add_argument("--key", help="API key (sk-...); default $AIHUB_API_KEY / file "
+                                 "config. Hati-hati: key di argv terlihat oleh "
+                                 "`ps` dan tersimpan di riwayat shell")
     p.add_argument("--key-file", help="baca API key dari baris pertama file")
     p.add_argument("--base-url", help="override base URL (default %s)" % DEFAULT_BASE)
     p.add_argument("--json", action="store_true", help="output JSON")
@@ -945,13 +994,20 @@ def main():
 
     base = resolve_base(args)
 
+    # `action` hanya bermakna untuk `store`; menolak sisanya mencegah typo seperti
+    # `aihub-usage balance status` diterima diam-diam lalu diabaikan.
+    if args.action and args.command != "store":
+        p.error("argumen %r hanya berlaku untuk `aihub-usage store on|off|status`"
+                % args.action)
+
     if args.command == "store":
         return cmd_store(args)
 
     if args.command == "save-key":
-        if not args.key:
-            fail("pakai: aihub-usage --key sk-... save-key")
-        cmd_save_key(args, base, args.key.strip())
+        # Lewat resolve_key supaya --key-file / $AIHUB_API_KEY juga diterima;
+        # memaksa --key berarti key selalu masuk argv (terlihat `ps` dan
+        # tersimpan di riwayat shell).
+        cmd_save_key(args, base, resolve_key(args, required=True))
         return 0
 
     key = resolve_key(args, required=(args.command != "status"))

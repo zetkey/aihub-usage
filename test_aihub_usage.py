@@ -58,7 +58,7 @@ def free_port():
 
 
 def start_mock(port, limited=False, errlog=False, empty_choices=False,
-               empty_logs=False, anykey=False):
+               empty_logs=False, anykey=False, redirect=None, record_auth=None):
     args = [sys.executable, MOCK, str(port)]
     if limited:
         args.append("--limited")
@@ -70,6 +70,10 @@ def start_mock(port, limited=False, errlog=False, empty_choices=False,
         args.append("--emptylogs")
     if anykey:
         args.append("--anykey")
+    if redirect is not None:
+        args += ["--redirect", str(redirect)]
+    if record_auth is not None:
+        args += ["--record-auth", record_auth]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
@@ -304,6 +308,30 @@ def main():
             case("arsip tidak bisa dibuka: fallback jendela + catatan, exit 0",
                  rc == 0 and "log terakhir" in out and "arsip lokal tidak bisa dipakai" in out,
                  out)
+
+            # kontrak JSON harus sama di kedua mode (script pemanggil tidak boleh
+            # KeyError hanya karena local_store diubah)
+            rc, off_out, err = run(b1, "tokens", "--json", db=adb)
+            rc2, on_out, err2 = run(b1, "tokens", "--store", "--json", db=adb)
+            try:
+                ko = set(json.loads(off_out)["tokens"])
+                kn = set(json.loads(on_out)["tokens"])
+                same = ko == kn
+            except Exception as e:
+                ko = kn = same = str(e)
+            case("JSON `tokens`: kunci sama di mode API dan mode arsip", same,
+                 "off=%s on=%s" % (sorted(ko), sorted(kn)))
+
+            # file arsip lama dengan mode longgar harus dirapikan ke 0600
+            loose = os.path.join(HERE, ".test_loose.sqlite")
+            open(loose, "w").close()
+            os.chmod(loose, 0o644)
+            run(b1, "tokens", "--store", db=loose)
+            case("arsip lama mode 0644 dirapikan jadi 0600",
+                 oct(stat.S_IMODE(os.stat(loose).st_mode)) == "0o600",
+                 oct(stat.S_IMODE(os.stat(loose).st_mode)))
+            if os.path.exists(loose):
+                os.remove(loose)
         finally:
             for f in (adb, os.path.join(HERE, ".test_empty.sqlite")):
                 if os.path.exists(f):
@@ -410,8 +438,79 @@ def main():
 
             rc, out, err = store("store", "ngawur")
             case("store: aksi tidak dikenal ditolak (exit 2)", rc == 2, rc)
+
+            rc, out, err = store("balance", "status")
+            case("action pada command non-store ditolak (exit 2)",
+                 rc == 2 and "hanya berlaku untuk" in err,
+                 "%s / %s" % (rc, err.strip()[-160:]))
         finally:
             for f in (scfg, sdb):
+                if os.path.exists(f):
+                    os.remove(f)
+
+        # --- redirect tidak boleh membocorkan header Authorization ----------
+        authlog = os.path.join(HERE, ".test_authlog.txt")
+        p7, p8 = free_port(), free_port()
+        if os.path.exists(authlog):
+            os.remove(authlog)
+        sink = start_mock(p7, anykey=True, record_auth=authlog)
+        redir = start_mock(p8, redirect=p7, anykey=True)
+        try:
+            b7 = "http://127.0.0.1:%d" % p7
+            b8 = "http://127.0.0.1:%d" % p8
+
+            # kontrol positif: request langsung memang mengirim key
+            run(b7, "models")
+            direct = open(authlog).read()
+            case("kontrol: request langsung mengirim Authorization",
+                 "Bearer " + KEY in direct, direct.strip()[-120:])
+
+            open(authlog, "w").close()
+            rc, out, err = run(b8, "models")
+            followed = open(authlog).read()
+            case("redirect lintas host: Authorization TIDAK diteruskan",
+                 "Bearer" not in followed and "AUTH=None" in followed,
+                 followed.strip()[-120:])
+        finally:
+            sink.kill()
+            redir.kill()
+            if os.path.exists(authlog):
+                os.remove(authlog)
+
+        # --- save-key bisa lewat env / --key-file (tidak wajib argv) --------
+        skcfg = os.path.join(HERE, ".test_savekey_src.json")
+        skfile = os.path.join(HERE, ".test_savekey_key")
+        for f in (skcfg, skfile):
+            if os.path.exists(f):
+                os.remove(f)
+        try:
+            p = subprocess.run([sys.executable, CLI, "save-key", "--base-url", b1],
+                               capture_output=True, text=True, timeout=60,
+                               env=clean_env(AIHUB_CONFIG=skcfg, AIHUB_API_KEY=KEY))
+            case("save-key: key dari $AIHUB_API_KEY (tanpa argv)",
+                 p.returncode == 0 and json.load(open(skcfg)).get("api_key") == KEY,
+                 "%s / %s" % (p.stderr.strip()[-120:], p.stdout.strip()[:80]))
+
+            with open(skfile, "w") as f:
+                f.write("# komentar\n" + KEY + "\n")
+            os.remove(skcfg)
+            p = subprocess.run([sys.executable, CLI, "--key-file", skfile,
+                                "save-key", "--base-url", b1],
+                               capture_output=True, text=True, timeout=60,
+                               env=clean_env(AIHUB_CONFIG=skcfg))
+            case("save-key: key dari --key-file",
+                 p.returncode == 0 and json.load(open(skcfg)).get("api_key") == KEY,
+                 "%s / %s" % (p.stderr.strip()[-120:], p.stdout.strip()[:80]))
+
+            os.remove(skcfg)
+            p = subprocess.run([sys.executable, CLI, "save-key"],
+                               capture_output=True, text=True, timeout=60,
+                               env=clean_env(AIHUB_CONFIG=skcfg))
+            case("save-key tanpa key sama sekali: pesan jelas + exit 1",
+                 p.returncode == 1 and "API key belum ada" in p.stderr,
+                 p.stderr.strip()[:160])
+        finally:
+            for f in (skcfg, skfile):
                 if os.path.exists(f):
                     os.remove(f)
 

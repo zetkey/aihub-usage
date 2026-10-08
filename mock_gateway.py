@@ -43,6 +43,10 @@ STATUS = {"data": {"system_name": "metranet AI", "version": "2576fe9",
 LIMITED = False
 # --anykey: terima bearer token apa pun (untuk menguji scope arsip per key)
 ANYKEY = False
+# --redirect PORT: /v1/models membalas 302 ke server lain (uji kebocoran header)
+REDIRECT_PORT = None
+# --record-auth PATH: catat header Authorization yang diterima ke file
+RECORD_AUTH = None
 # --errlog: /api/log/token membalas HTTP 200 + {"success":false} seperti
 # common.ApiError new-api saat handler gagal.
 ERRLOG = False
@@ -56,19 +60,27 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, obj, code=200):
+    def _send(self, obj, code=200, extra=None):
         b = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        for k, v in (extra or dict()).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
         self.wfile.write(b)
 
     def do_GET(self):
         auth = self.headers.get("Authorization", "")
+        if RECORD_AUTH:
+            with open(RECORD_AUTH, "a") as f:
+                f.write("AUTH=%r\n" % (self.headers.get("Authorization")))
         p = self.path.split("?")[0]
         if p == "/api/status":
             return self._send(STATUS)
+        if REDIRECT_PORT and p == "/v1/models":
+            return self._send({"data":[]}, 302,
+                              {"Location": "http://127.0.0.1:%d/v1/models" % REDIRECT_PORT})
         if auth != "Bearer " + KEY and not ANYKEY:
             return self._send({"error": {"message": "Invalid token", "type": "new_api_error"}}, 401)
         if p in ("/v1/dashboard/billing/subscription", "/dashboard/billing/subscription"):
@@ -112,6 +124,10 @@ if __name__ == "__main__":
     import sys
     LIMITED = "--limited" in sys.argv
     ANYKEY = "--anykey" in sys.argv
+    if "--redirect" in sys.argv:
+        REDIRECT_PORT = int(sys.argv[sys.argv.index("--redirect") + 1])
+    if "--record-auth" in sys.argv:
+        RECORD_AUTH = sys.argv[sys.argv.index("--record-auth") + 1]
     ERRLOG = "--errlog" in sys.argv
     EMPTY_LOGS = "--emptylogs" in sys.argv
     EMPTY_CHOICES = "--emptychoices" in sys.argv
