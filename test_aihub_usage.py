@@ -58,7 +58,8 @@ def free_port():
 
 
 def start_mock(port, limited=False, errlog=False, empty_choices=False,
-               empty_logs=False, anykey=False, redirect=None, record_auth=None):
+               empty_logs=False, anykey=False, redirect=None, record_auth=None,
+               gzip_ok=False, concurrency=None, delay_ms=None, counts=None):
     args = [sys.executable, MOCK, str(port)]
     if limited:
         args.append("--limited")
@@ -74,6 +75,14 @@ def start_mock(port, limited=False, errlog=False, empty_choices=False,
         args += ["--redirect", str(redirect)]
     if record_auth is not None:
         args += ["--record-auth", record_auth]
+    if gzip_ok:
+        args.append("--gzip")
+    if concurrency is not None:
+        args += ["--concurrency", concurrency]
+    if delay_ms is not None:
+        args += ["--delay", str(delay_ms)]
+    if counts is not None:
+        args += ["--counts", counts]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
@@ -513,6 +522,69 @@ def main():
             for f in (skcfg, skfile):
                 if os.path.exists(f):
                     os.remove(f)
+
+        # --- gzip & paralelisme ---------------------------------------------
+        gz_port, cc_port = free_port(), free_port()
+        ccfile = os.path.join(HERE, ".test_concurrency.txt")
+        if os.path.exists(ccfile):
+            os.remove(ccfile)
+        gz = start_mock(gz_port, gzip_ok=True)
+        cc = start_mock(cc_port, concurrency=ccfile, delay_ms=120)
+        try:
+            bg = "http://127.0.0.1:%d" % gz_port
+            bc = "http://127.0.0.1:%d" % cc_port
+
+            rc, out, err = run(bg, "all")
+            case("gzip: respons terkompresi tetap terbaca benar",
+                 rc == 0 and "SISA CREDIT   : $11.11" in out
+                 and "TOTAL TOKEN   : 2,440" in out, out)
+
+            rc, gz_json, err = run(bg, "tokens", "--json")
+            rc2, plain_json, err2 = run(b1, "tokens", "--json")
+            try:
+                same = json.loads(gz_json)["tokens"] == json.loads(plain_json)["tokens"]
+            except Exception as e:
+                same = str(e)
+            case("gzip: angka identik dengan respons tanpa kompresi", same is True,
+                 same)
+
+            # paralel: beberapa request harus benar-benar bersamaan di gateway
+            run(bc, "all")
+            peak = int(open(ccfile).read().strip() or 0)
+            case("request endpoint dijalankan paralel (puncak > 1)",
+                 peak > 1, "puncak bersamaan = %d" % peak)
+
+            # setiap endpoint harus diambil tepat sekali per perintah (menangkap
+            # sisa pemanggilan sekuensial setelah refactor paralel)
+            for cmd, expect in (("models", {"/api/status", "/v1/models"}),
+                                ("all", {"/api/status", "/v1/models",
+                                         "/v1/dashboard/billing/subscription",
+                                         "/v1/dashboard/billing/usage",
+                                         "/api/usage/token/", "/api/log/token"})):
+                cntf = os.path.join(HERE, ".test_counts.json")
+                if os.path.exists(cntf):
+                    os.remove(cntf)
+                cp = free_port()
+                m = start_mock(cp, counts=cntf)
+                try:
+                    # buang hitungan probe kesiapan start_mock(); mock menyimpan
+                    # hitungan di memori, jadi harus lewat /__reset.
+                    urllib.request.urlopen("http://127.0.0.1:%d/__reset" % cp,
+                                           timeout=5).read()
+                    run("http://127.0.0.1:%d" % cp, cmd)
+                    counts = json.load(open(cntf))
+                finally:
+                    m.kill()
+                    if os.path.exists(cntf):
+                        os.remove(cntf)
+                dup = {k: v for k, v in counts.items() if v > 1}
+                case("%s: tidak ada endpoint diambil dua kali" % cmd,
+                     not dup, "duplikat: %s (semua: %s)" % (dup, counts))
+        finally:
+            gz.kill()
+            cc.kill()
+            if os.path.exists(ccfile):
+                os.remove(ccfile)
 
         # --- stdout ditutup lebih awal (mis. `aihub-usage tokens | head`) ----
         pipe = " ".join(shlex.quote(x) for x in

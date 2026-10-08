@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)](#persyaratan)
-[![Tests](https://img.shields.io/badge/tests-96%20passed-brightgreen)](#pengembangan)
+[![Tests](https://img.shields.io/badge/tests-101%20passed-brightgreen)](#pengembangan)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#persyaratan)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -119,6 +119,8 @@ PEMAKAIAN TOKEN
 - **Daftar model** — model yang bisa dipakai oleh key tersebut.
 - **Probe** — kirim satu request kecil untuk memastikan key benar-benar jalan.
 - **Mode JSON & exit code** — siap dipakai di script, cron, atau monitoring.
+- **Cepat** — semua endpoint diambil paralel dan respons diterima dalam gzip;
+  `aihub-usage` turun dari ~0,8 s ke ~0,3 s dibanding versi sekuensial.
 - **Tanpa dependensi** — hanya stdlib Python 3.8+.
 - **Key tidak pernah bocor** — key hanya tampil sebagai nama, tidak pernah di-print.
 
@@ -352,6 +354,23 @@ Semua data diambil dari endpoint new-api yang memang sudah ada:
 | Info gateway (kurs, satuan) | `GET /api/status` | publik |
 | Probe 1 request | `POST /v1/chat/completions` atau `POST /v1/messages` | API key |
 
+### Kenapa cepat
+
+Dua hal yang membuat CLI ini selesai dalam ~0,3 s, bukan ~0,8 s:
+
+- **Request paralel.** Semua endpoint di atas saling independen, jadi dijalankan
+  bersamaan lewat `ThreadPoolExecutor`. Sebelumnya tiap endpoint membuka koneksi
+  TLS sendiri secara berurutan, jadi biayanya dijumlahkan (6 × ~140 ms). Sekarang
+  totalnya ditentukan endpoint terlama (`/api/log/token`), bukan jumlah endpoint.
+- **gzip.** Request mengirim `Accept-Encoding: gzip, deflate`. `/api/log/token`
+  bisa >500 KB mentah dan turun ke ~30 KB, jadi endpoint yang paling berat itu
+  selesai jauh lebih cepat. Kalau gateway tidak mendukung kompresi, tidak ada
+  yang berubah — respons dibaca apa adanya.
+
+`/api/status` dan `/v1/models` tidak dikompresi gateway (masing-masing ~90 KB dan
+~19 KB), jadi keduanya memang tetap menjadi bagian biaya terbesar pada perintah
+yang memakainya.
+
 Beberapa detail yang mudah salah baca:
 
 - **Satuan internal gateway adalah `quota`.** `500.000 quota = $1`, dan nilainya
@@ -417,23 +436,25 @@ python3 test_aihub_usage.py
 Test suite menjalankan CLI terhadap `mock_gateway.py` yang meniru response asli
 new-api (bentuk `/v1/dashboard/billing/*` yang memakai cent, key unlimited vs
 terbatas, log semua tipe, ringkasan token + rincian per model, arsip lokal
-termasuk dedupe/scope/fallback, body error 401, envelope `success:false`, sampai
-isolasi config/env). **Tidak memakai credit asli dan tidak butuh API key** —
-config **dan arsip** asli sengaja diabaikan lewat `AIHUB_CONFIG`/`AIHUB_DB` agar
-hasilnya sama di mesin siapa pun dan arsip asli Anda tidak tersentuh.
+termasuk dedupe/scope/fallback, gzip, paralelisme (puncak request bersamaan),
+tidak ada endpoint diambil dua kali, body error 401, envelope `success:false`,
+sampai isolasi config/env). **Tidak memakai credit asli dan tidak butuh API
+key** — config **dan arsip** asli sengaja diabaikan lewat
+`AIHUB_CONFIG`/`AIHUB_DB` agar hasilnya sama di mesin siapa pun dan arsip asli
+Anda tidak tersentuh.
 
 ```bash
 AIHUB_CLI=/path/lain/aihub-usage python3 test_aihub_usage.py   # uji versi lain
 ```
 
-Status: **96/96 passed**.
+Status: **101/101 passed**.
 
 Struktur repo:
 
 ```
 aihub-usage            script utama (executable, di-symlink ke ~/.local/bin)
 install.sh             pemasangan symlink dan uninstall
-test_aihub_usage.py    test suite (96 kasus, tanpa API key asli)
+test_aihub_usage.py    test suite (101 kasus, tanpa API key asli)
 mock_gateway.py        mock new-api untuk keperluan tes
 README.md              dokumen ini
 ```

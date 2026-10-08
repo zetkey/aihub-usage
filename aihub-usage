@@ -34,6 +34,7 @@ error, bukan sebagai data kosong.
 """
 
 import argparse
+import gzip
 import hashlib
 import http.client
 import json
@@ -45,6 +46,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 DEFAULT_BASE = "https://aihub.metranet.co.id"
@@ -113,9 +116,28 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 OPENER = urllib.request.build_opener(SafeRedirect)
 
+def read_body(resp):
+    """Baca body, buka gzip/deflate bila gateway mengompresnya.
+
+    /api/log/token bisa >500 KB mentah; dengan gzip turun ke ~30 KB sehingga
+    request itu jauh lebih cepat. urllib tidak membuka kompresi sendiri.
+    """
+    raw = resp.read()
+    enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
+    if enc == "gzip":
+        raw = gzip.decompress(raw)
+    elif enc == "deflate":
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+    return raw.decode("utf-8", "replace")
+
+
 def http(method, url, key=None, body=None, headers=None, timeout=TIMEOUT):
     """Return (status, parsed_json_or_text). Tidak pernah mencetak key."""
-    hdrs = {"Accept": "application/json", "User-Agent": "aihub-usage/1.0"}
+    hdrs = {"Accept": "application/json", "User-Agent": "aihub-usage/1.0",
+            "Accept-Encoding": "gzip, deflate"}
     if key:
         hdrs["Authorization"] = "Bearer " + key
     if headers:
@@ -131,16 +153,16 @@ def http(method, url, key=None, body=None, headers=None, timeout=TIMEOUT):
         raise ApiError(0, "base URL tidak valid (%s): %s" % (e, url))
     try:
         with OPENER.open(req, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "replace")
+            raw = read_body(r)
             status = r.status
     except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+        raw = read_body(e)
         status = e.code
     except urllib.error.URLError as e:
         raise ApiError(0, "tidak bisa konek ke %s (%s)" % (url, e.reason))
     except OSError as e:
         raise ApiError(0, "network error: %s" % e)
-    except http.client.HTTPException as e:
+    except (http.client.HTTPException, gzip.BadGzipFile, zlib.error) as e:
         # balasan rusak dari gateway/proxy (status line tidak valid, body terpotong)
         raise ApiError(0, "balasan tidak valid dari %s: %s" % (url, e))
     try:
@@ -563,40 +585,48 @@ def cmd_status(base):
 
 def collect(args, base, key):
     out = {"base_url": base}
-    st = None
-    try:
-        st = get_status(base)
+
+    # Semua request di bawah saling independen, jadi dijalankan paralel: satu
+    # round-trip TLS per endpoint membuat versi sekuensial memakan waktu
+    # ~850 ms, sedangkan paralel ~220 ms (terlama yang menentukan).
+    jobs = {"status": lambda: get_status(base)}
+    # --warn-below butuh saldo akun, jadi selalu ikut diambil walau command-nya
+    # bukan `balance` (mis. `aihub-usage key --warn-below 5`).
+    if args.command in ("all", "balance") or args.warn_below is not None:
+        jobs["balance"] = lambda: get_balance(base, key)
+    if args.command in ("all", "key", "tokens"):
+        jobs["token"] = lambda: get_token_usage(base, key)
+    # `all` dan `tokens` perlu jendela log untuk ringkasan token; `logs` untuk
+    # tabelnya. Satu kali ambil, dipakai keduanya.
+    if args.command in ("all", "logs", "tokens"):
+        jobs["logs"] = lambda: get_logs(base, key)
+    if args.command == "models":
+        jobs["models"] = lambda: get_models(base, key)
+
+    results = {}
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as ex:
+            futs = {name: ex.submit(fn) for name, fn in jobs.items()}
+            for name, fut in futs.items():
+                try:
+                    results[name] = fut.result()
+                except ApiError as e:
+                    out[name + "_error"] = e.message
+
+    st = results.get("status")
+    if st is not None:
         out["status"] = {
             "gateway": st.get("system_name"),
             "version": st.get("version"),
             "quota_per_unit": st.get("quota_per_unit") or DEFAULT_QUOTA_PER_UNIT,
             "currency_rates": st.get("currency_rates") or {},
         }
-    except ApiError as e:
-        out["status_error"] = e.message
     status = out.get("status") or {}
     qpu = status.get("quota_per_unit") or DEFAULT_QUOTA_PER_UNIT
     rates = status.get("currency_rates") or {}
-
-    # --warn-below butuh saldo akun, jadi selalu ikut diambil walau command-nya
-    # bukan `balance` (mis. `aihub-usage key --warn-below 5`).
-    if args.command in ("all", "balance") or args.warn_below is not None:
-        try:
-            out["balance"] = get_balance(base, key)
-        except ApiError as e:
-            out["balance_error"] = e.message
-    if args.command in ("all", "key", "tokens"):
-        try:
-            out["token"] = get_token_usage(base, key)
-        except ApiError as e:
-            out["token_error"] = e.message
-    # `all` dan `tokens` perlu jendela log untuk ringkasan token; `logs` untuk
-    # tabelnya. Satu kali ambil, dipakai keduanya.
-    if args.command in ("all", "logs", "tokens"):
-        try:
-            out["logs"] = get_logs(base, key)
-        except ApiError as e:
-            out["logs_error"] = e.message
+    for name in ("balance", "token", "logs", "models"):
+        if name in results:
+            out[name] = results[name]
     if "logs" in out:
         out["tokens"] = summarize_tokens(out["logs"], qpu)
         # Arsip lokal (default off, lihat store_enabled): arsipkan dulu, lalu
@@ -620,11 +650,6 @@ def collect(args, base, key):
     elif args.command in ("all", "tokens"):
         # untuk `logs` kegagalannya sudah dilaporkan bagian LOG, tidak perlu dobel
         out["tokens_error"] = out["logs_error"]
-    if args.command == "models":
-        try:
-            out["models"] = get_models(base, key)
-        except ApiError as e:
-            out["models_error"] = e.message
     out["_qpu"] = qpu
     out["_rates"] = rates
     return out
