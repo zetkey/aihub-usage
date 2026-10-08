@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# artefak test
+.test_*
+
+# macOS
+.DS_Store
+
+# JANGAN pernah commit API key
+.env
+.env.*
+config.json
+key
+*.key

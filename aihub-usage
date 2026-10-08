@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+aihub-usage — cek sisa credit (saldo) dan pemakaian API key di Scala AI Gateway
+by Metranet (https://aihub.metranet.co.id).
+
+Gateway ini berbasis new-api (QuantumNous), jadi endpoint yang dipakai:
+
+  GET /api/status                            info gateway (quota_per_unit, kurs)
+  GET /v1/dashboard/billing/subscription     total credit akun        [auth: API key]
+  GET /v1/dashboard/billing/usage            credit terpakai          [auth: API key]
+  GET /api/usage/token/                      kuota + pemakaian key    [auth: API key]
+  GET /api/log/token                         log request key ini      [auth: API key]
+  GET /v1/models                             daftar model             [auth: API key]
+  POST /v1/chat/completions | /v1/messages   probe 1 token (opsional)
+
+Konversi: 500.000 quota = $1 (diambil dinamis dari /api/status).
+
+API key diambil berurutan dari: --key, --key-file, $AIHUB_API_KEY, lalu file config
+(~/.config/aihub/config.json). Tidak ada key yang ditulis ke log.
+"""
+
+import argparse
+import json
+import os
+import stat
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone, timedelta
+
+DEFAULT_BASE = "https://aihub.metranet.co.id"
+DEFAULT_QUOTA_PER_UNIT = 500_000  # fallback; nilai asli diambil dari /api/status
+CONFIG_PATH = os.path.expanduser(os.environ.get("AIHUB_CONFIG", "~/.config/aihub/config.json"))
+TIMEOUT = 30
+WIB = timezone(timedelta(hours=7))
+
+# tipe log new-api (kolom `type`)
+LOG_TYPES = {
+    1: "isi saldo",
+    2: "pemakaian",
+    3: "kelola",
+    4: "sistem",
+    5: "refund",
+    6: "error",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, status, message, body=None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.body = body
+
+
+# --------------------------------------------------------------------------- io
+
+
+def http(method, url, key=None, body=None, headers=None, timeout=TIMEOUT):
+    """Return (status, parsed_json_or_text). Tidak pernah mencetak key."""
+    hdrs = {"Accept": "application/json", "User-Agent": "aihub-usage/1.0"}
+    if key:
+        hdrs["Authorization"] = "Bearer " + key
+    if headers:
+        hdrs.update(headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+            status = r.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        status = e.code
+    except urllib.error.URLError as e:
+        raise ApiError(0, "tidak bisa konek ke %s (%s)" % (url, e.reason))
+    except OSError as e:
+        raise ApiError(0, "network error: %s" % e)
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, raw
+
+
+def fail(msg, code=1):
+    print("ERROR: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception as e:
+        fail("config %s tidak bisa dibaca: %s" % (CONFIG_PATH, e))
+
+
+def resolve_key(args, required=True):
+    if args.key:
+        return args.key.strip()
+    if args.key_file:
+        try:
+            with open(os.path.expanduser(args.key_file)) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        return line
+        except OSError as e:
+            fail("tidak bisa baca --key-file: %s" % e)
+        fail("--key-file kosong")
+    env = os.environ.get("AIHUB_API_KEY", "").strip()
+    if env:
+        return env
+    cfg = load_config()
+    if cfg.get("api_key"):
+        return str(cfg["api_key"]).strip()
+    if not required:
+        return None
+    fail(
+        "API key belum ada. Set salah satu:\n"
+        "  export AIHUB_API_KEY=sk-...\n"
+        "  aihub-usage --key sk-... <command>\n"
+        "  aihub-usage --key-file ~/.config/aihub/key <command>\n"
+        "  aihub-usage --key sk-... save-key   (simpan ke %s)" % CONFIG_PATH
+    )
+
+
+def resolve_base(args):
+    if args.base_url:
+        return args.base_url.rstrip("/")
+    env = os.environ.get("AIHUB_BASE_URL", "").strip()
+    if env:
+        return env.rstrip("/")
+    cfg = load_config()
+    if cfg.get("base_url"):
+        return str(cfg["base_url"]).rstrip("/")
+    return DEFAULT_BASE
+
+
+def api(base, path, key, method="GET", body=None, headers=None):
+    status, data = http(method, base + path, key=key, body=body, headers=headers)
+    if status == 401:
+        raise ApiError(401, "API key ditolak (401). Cek key / apakah key masih aktif.")
+    if status == 403:
+        msg = data.get("message") if isinstance(data, dict) else data
+        raise ApiError(403, "akses ditolak (403): %s" % msg)
+    if status >= 400:
+        if isinstance(data, dict):
+            err = data.get("error") or {}
+            msg = err.get("message") if isinstance(err, dict) else None
+            msg = msg or data.get("message") or json.dumps(data)
+        else:
+            msg = str(data)[:200]
+        raise ApiError(status, "HTTP %s: %s" % (status, msg))
+    if isinstance(data, dict) and isinstance(data.get("error"), dict) and data["error"].get("message"):
+        raise ApiError(status, data["error"]["message"])
+    return data
+
+
+# ------------------------------------------------------------------- endpoints
+
+
+def get_status(base, key=None):
+    status, data = http("GET", base + "/api/status")
+    if status != 200 or not isinstance(data, dict):
+        raise ApiError(status, "gagal ambil /api/status")
+    return data.get("data", data)
+
+
+def get_balance(base, key):
+    """Credit akun dari sudut pandang API key (endpoint [OI]-compatible)."""
+    sub = api(base, "/v1/dashboard/billing/subscription", key)
+    use = api(base, "/v1/dashboard/billing/usage", key)
+    total = float(sub.get("hard_limit_usd") or 0.0)
+    used = float(use.get("total_usage") or 0.0) / 100.0  # endpoint ini pakai cent
+    return {
+        "total_usd": total,
+        "used_usd": used,
+        "remaining_usd": total - used,
+        "access_until": sub.get("access_until") or 0,
+    }
+
+
+def get_token_usage(base, key):
+    d = api(base, "/api/usage/token/", key)
+    return d.get("data") or {}
+
+
+def get_logs(base, key):
+    d = api(base, "/api/log/token", key)
+    return d.get("data") or []
+
+
+def get_models(base, key):
+    d = api(base, "/v1/models", key)
+    return [m.get("id") for m in (d.get("data") or []) if m.get("id")]
+
+
+# ------------------------------------------------------------------- formatting
+
+
+def usd(x, unit="$"):
+    return "%s%s" % (unit, format_money(x))
+
+
+def format_money(x):
+    return "{:,.4f}".format(x) if abs(x) < 1 else "{:,.2f}".format(x)
+
+
+def format_quota(x):
+    """quota_per_unit tampil sebagai bilangan bulat bila memang bulat."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    return "{:,.0f}".format(f) if f.is_integer() else "{:,.4f}".format(f)
+
+
+def kurs_str(rates):
+    """'CNY=7, IDR=18000, USD=1' dari currency_rates."""
+    if not isinstance(rates, dict) or not rates:
+        return "-"
+    return ", ".join("%s=%s" % (k, v) for k, v in sorted(rates.items()))
+
+
+def format_idr(x):
+    """Format rupiah gaya Indonesia: Rp 200.000 (tanpa desimal)."""
+    try:
+        return "Rp " + "{:,.0f}".format(float(x)).replace(",", ".")
+    except (TypeError, ValueError):
+        return "Rp -"
+
+
+def fmt_ts(ts, fallback="—"):
+    if not ts:
+        return fallback
+    try:
+        return datetime.fromtimestamp(int(ts), WIB).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, OSError, OverflowError):
+        return fallback
+
+
+def quota_to_usd(q, qpu):
+    try:
+        return float(q) / float(qpu or DEFAULT_QUOTA_PER_UNIT)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+# -------------------------------------------------------------------- commands
+
+
+def cmd_status(args, base, key):
+    st = get_status(base, key)
+    qpu = st.get("quota_per_unit") or DEFAULT_QUOTA_PER_UNIT
+    rates = st.get("currency_rates") or {}
+    return {
+        "base_url": base,
+        "gateway": st.get("system_name"),
+        "version": st.get("version"),
+        "quota_per_unit": qpu,
+        "quota_display_type": st.get("quota_display_type"),
+        "currency_rates": rates,
+        "docs": (base + str(st.get("docs_link") or "/docs/")),
+    }
+
+
+def collect(args, base, key):
+    out = {"base_url": base}
+    st = None
+    try:
+        st = get_status(base, key)
+        out["status"] = {
+            "gateway": st.get("system_name"),
+            "version": st.get("version"),
+            "quota_per_unit": st.get("quota_per_unit") or DEFAULT_QUOTA_PER_UNIT,
+            "currency_rates": st.get("currency_rates") or {},
+        }
+    except ApiError as e:
+        out["status_error"] = e.message
+    status = out.get("status") or {}
+    qpu = status.get("quota_per_unit") or DEFAULT_QUOTA_PER_UNIT
+    rates = status.get("currency_rates") or {}
+
+    if args.command in ("all", "usage", "balance"):
+        try:
+            out["balance"] = get_balance(base, key)
+        except ApiError as e:
+            out["balance_error"] = e.message
+    if args.command in ("all", "usage", "key"):
+        try:
+            out["token"] = get_token_usage(base, key)
+        except ApiError as e:
+            out["token_error"] = e.message
+    if args.command == "logs":
+        try:
+            out["logs"] = get_logs(base, key)[: args.limit]
+        except ApiError as e:
+            out["logs_error"] = e.message
+    if args.command == "models":
+        try:
+            out["models"] = get_models(base, key)
+        except ApiError as e:
+            out["models_error"] = e.message
+    out["_qpu"] = qpu
+    out["_rates"] = rates
+    return out
+
+
+def print_report(d, args):
+    qpu = d.pop("_qpu", DEFAULT_QUOTA_PER_UNIT)
+    rates = d.pop("_rates", {})
+    idr_rate = float(rates.get("IDR") or 0) or None
+
+    def rupiah(u):
+        return "  (%s)" % format_idr(u * idr_rate) if idr_rate else ""
+
+    if args.json:
+        print(json.dumps(d, indent=2, ensure_ascii=False))
+        return
+
+    st = d.get("status") or {}
+    print("Scala AI Gateway — %s" % (st.get("gateway") or d.get("base_url")))
+    print("  base URL      : %s" % d.get("base_url"))
+    if st.get("version"):
+        print("  versi gateway : %s" % st["version"])
+    print("  satuan        : %s quota = $1" % format_quota(qpu))
+    if st.get("currency_rates"):
+        print("  kurs          : %s" % ", ".join(
+            "%s=%s" % (k, v) for k, v in sorted(st["currency_rates"].items())))
+    if d.get("status_error"):
+        print("  (gagal ambil /api/status: %s)" % d["status_error"])
+
+    bal = d.get("balance")
+    if bal:
+        print("\nCREDIT AKUN")
+        print("  total credit  : %s" % usd(bal["total_usd"]))
+        print("  terpakai      : %s" % usd(bal["used_usd"]))
+        print("  SISA CREDIT   : %s%s" % (usd(bal["remaining_usd"]), rupiah(bal["remaining_usd"])))
+        if bal.get("access_until"):
+            print("  masa aktif    : sampai %s" % fmt_ts(bal["access_until"]))
+        else:
+            print("  masa aktif    : tidak dibatasi")
+    elif d.get("balance_error"):
+        print("\nCREDIT AKUN\n  gagal: %s" % d["balance_error"])
+
+    tok = d.get("token")
+    if tok:
+        print("\nAPI KEY INI")
+        if tok.get("name"):
+            print("  nama          : %s" % tok["name"])
+        unlimited = bool(tok.get("unlimited_quota"))
+        print("  limit key     : %s" % ("unlimited (ikut saldo akun)" if unlimited
+                                        else usd(quota_to_usd(tok.get("total_granted"), qpu))))
+        print("  terpakai key  : %s" % usd(quota_to_usd(tok.get("total_used"), qpu)))
+        if unlimited:
+            print("  sisa kuota key: unlimited")
+        else:
+            print("  sisa kuota key: %s" % usd(quota_to_usd(tok.get("total_available"), qpu)))
+        print("  kadaluarsa    : %s" % (fmt_ts(tok.get("expires_at"), "tidak ada")))
+        if tok.get("model_limits_enabled"):
+            lims = tok.get("model_limits") or {}
+            if isinstance(lims, dict):
+                names = sorted(k for k in lims.keys() if k)
+            else:
+                names = sorted(str(x) for x in lims if x)
+            print("  batas model   : %s" % (", ".join(names) or "semua model"))
+        else:
+            print("  batas model   : semua model")
+        if bal and not unlimited:
+            drift = abs(quota_to_usd(tok.get("total_granted"), qpu) - bal["total_usd"])
+            if drift > 0.01:
+                print("  catatan       : angka akun & angka key beda -> gateway menghitung "
+                      "statistik per-akun (bukan per-key); pakai baris SISA CREDIT untuk saldo riil.")
+    elif d.get("token_error"):
+        print("\nAPI KEY INI\n  gagal: %s" % d["token_error"])
+
+    if "models" in d or d.get("models_error"):
+        print("\nMODEL")
+        if d.get("models_error"):
+            print("  gagal: %s" % d["models_error"])
+        else:
+            ms = d["models"]
+            print("  tersedia      : %d model" % len(ms))
+            print("  contoh        : %s" % ", ".join(ms[:8]))
+
+    if "logs" in d or d.get("logs_error"):
+        print("\nLOG TERAKHIR (key ini)")
+        if d.get("logs_error"):
+            print("  gagal: %s" % d["logs_error"])
+        else:
+            logs = d["logs"]
+            if not logs:
+                print("  belum ada log.")
+            else:
+                print("  %-16s %-28s %10s %10s %10s %7s" %
+                      ("waktu", "model", "in", "out", "biaya", "detik"))
+                for lg in logs:
+                    print("  %-16s %-28s %10s %10s %10s %7s" % (
+                        fmt_ts(lg.get("created_at")),
+                        (lg.get("model_name") or LOG_TYPES.get(lg.get("type"), "-"))[:28],
+                        lg.get("prompt_tokens", 0),
+                        lg.get("completion_tokens", 0),
+                        usd(quota_to_usd(lg.get("quota"), qpu)),
+                        lg.get("use_time", 0),
+                    ))
+
+
+def cmd_probe(args, base, key):
+    model = args.model
+    if not model:
+        models = get_models(base, key)
+        if not models:
+            fail("tidak ada model yang tersedia untuk key ini; pakai --model <nama>")
+        model = models[0]
+    if args.anthropic:
+        body = {"model": model, "max_tokens": args.max_tokens,
+                "messages": [{"role": "user", "content": "hi"}]}
+        data = api(base, "/v1/messages", key, method="POST", body=body,
+                   headers={"anthropic-version": "2023-06-01"})
+        usage = data.get("usage") or {}
+        got = "".join(b.get("text", "") for b in (data.get("content") or [])
+                      if isinstance(b, dict))
+        print("OK (anthropic /v1/messages)  model=%s" % data.get("model", model))
+        print("  input  : %s token" % usage.get("input_tokens"))
+        print("  output : %s token" % usage.get("output_tokens"))
+        print("  jawab  : %r" % got[:60])
+    else:
+        body = {"model": model, "max_tokens": args.max_tokens,
+                "messages": [{"role": "user", "content": "hi"}]}
+        data = api(base, "/v1/chat/completions", key, method="POST", body=body)
+        usage = data.get("usage") or {}
+        choice = (data.get("choices") or [])[0]
+        print("OK (/v1/chat/completions)  model=%s" % data.get("model", model))
+        print("  prompt : %s token" % usage.get("prompt_tokens"))
+        print("  output : %s token" % usage.get("completion_tokens"))
+        msg = choice.get("message")
+        if not isinstance(msg, dict):
+            msg = dict()
+        print("  jawab  : %r" % str(msg.get("content", ""))[:60])
+
+
+def cmd_save_key(args, base, key):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    cfg = load_config()
+    cfg["api_key"] = key
+    if args.base_url:
+        cfg["base_url"] = base
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    print("API key disimpan di %s (mode 0600)." % CONFIG_PATH)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="aihub-usage",
+        description="Cek sisa credit & pemakaian API key di Scala AI Gateway (aihub.metranet.co.id).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Contoh:\n"
+               "  aihub-usage                          # status + credit + info key\n"
+               "  aihub-usage balance --warn-below 5   # exit code 3 kalau sisa < $5\n"
+               "  aihub-usage logs -n 20               # 20 request terakhir key ini\n"
+               "  aihub-usage models                   # daftar model\n"
+               "  aihub-usage probe --anthropic        # tes 1 request via /v1/messages\n"
+               "  aihub-usage --json                   # output JSON untuk script lain\n")
+    p.add_argument("command", nargs="?",
+                   choices=["all", "usage", "balance", "key", "logs", "models",
+                            "status", "probe", "save-key"],
+                   default="all")
+    p.add_argument("--key", help="API key (sk-...); default $AIHUB_API_KEY / file config")
+    p.add_argument("--key-file", help="baca API key dari baris pertama file")
+    p.add_argument("--base-url", help="override base URL (default %s)" % DEFAULT_BASE)
+    p.add_argument("--json", action="store_true", help="output JSON")
+    p.add_argument("-n", "--limit", type=int, default=10, help="jumlah log (default 10)")
+    p.add_argument("--warn-below", type=float, metavar="USD",
+                   help="exit code 3 kalau sisa credit di bawah nilai ini")
+    p.add_argument("--model", help="model untuk probe")
+    p.add_argument("--max-tokens", type=int, default=1, help="max_tokens probe (default 1)")
+    p.add_argument("--anthropic", action="store_true", help="probe lewat /v1/messages")
+    args = p.parse_args()
+
+    base = resolve_base(args)
+
+    if args.command == "save-key":
+        if not args.key:
+            fail("pakai: aihub-usage --key sk-... save-key")
+        cmd_save_key(args, base, args.key.strip())
+        return 0
+
+    key = resolve_key(args, required=(args.command != "status"))
+
+    try:
+        if args.command == "status":
+            info = cmd_status(args, base, key)
+            print(json.dumps(info, indent=2, ensure_ascii=False) if args.json
+                  else "Scala AI Gateway — %s\n  base URL : %s\n  versi    : %s\n"
+                       "  satuan   : %s quota = $1\n  kurs     : %s\n  docs     : %s" % (
+                           info.get("gateway"), info["base_url"], info.get("version"),
+                           format_quota(info["quota_per_unit"]),
+                           kurs_str(info.get("currency_rates")), info["docs"]))
+        elif args.command == "probe":
+            cmd_probe(args, base, key)
+        else:
+            result = collect(args, base, key)
+            print_report(result, args)
+            if result.get("balance_error"):
+                print("\nGagal mengambil data credit: %s" % result["balance_error"],
+                      file=sys.stderr)
+                return 1
+            if args.warn_below is not None:
+                rem = result["balance"]["remaining_usd"]
+                if rem < args.warn_below:
+                    print("\n!! SISA CREDIT %s DI BAWAH BATAS %s" %
+                          (usd(rem), usd(args.warn_below)), file=sys.stderr)
+                    return 3
+    except ApiError as e:
+        fail(e.message)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
