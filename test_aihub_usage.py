@@ -59,7 +59,8 @@ def free_port():
 
 def start_mock(port, limited=False, errlog=False, empty_choices=False,
                empty_logs=False, anykey=False, redirect=None, record_auth=None,
-               gzip_ok=False, concurrency=None, delay_ms=None, counts=None):
+               gzip_ok=False, concurrency=None, delay_ms=None, counts=None,
+               posids=False):
     args = [sys.executable, MOCK, str(port)]
     if limited:
         args.append("--limited")
@@ -83,6 +84,8 @@ def start_mock(port, limited=False, errlog=False, empty_choices=False,
         args += ["--delay", str(delay_ms)]
     if counts is not None:
         args += ["--counts", counts]
+    if posids:
+        args.append("--posids")
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
@@ -297,6 +300,27 @@ def main():
             case("arsip: key lain punya arsip sendiri (scope key_hash)",
                  p.returncode == 0 and "4 log baru diarsipkan" in p.stdout
                  and "8 log di arsip" not in p.stdout, p.stdout[-300:])
+
+            # regresi dedupe: gateway asli memberi `id` = nomor urut jendela
+            # (1 = terbaru) yang berubah tiap fetch. Dedupe pakai id membuat
+            # arsip beku di fetch pertama (semua fetch berikutnya dianggap
+            # duplikat). request_id-lah yang harus jadi identitas.
+            pbport = free_port()
+            pb = start_mock(pbport, posids=True)
+            try:
+                b7 = "http://127.0.0.1:%d" % pbport
+                adb2 = os.path.join(HERE, ".test_archive_posids.sqlite")
+                if os.path.exists(adb2):
+                    os.remove(adb2)
+                rc, out, err = run(b7, "tokens", "--store", db=adb2)
+                case("arsip: gateway id posisional, run pertama mengarsipkan",
+                     rc == 0 and "4 log baru diarsipkan" in out, out[-300:])
+                rc, out, err = run(b7, "tokens", "--store", db=adb2)
+                case("arsip: id di-re-number antar-run tetap 0 log baru (dedupe request_id)",
+                     rc == 0 and "0 log baru diarsipkan" in out
+                     and "TOTAL TOKEN   : 2,440" in out, out[-300:])
+            finally:
+                pb.kill()
 
             # --no-store menang atas $AIHUB_STORE
             rc, out, err = run(b1, "tokens", "--no-store",

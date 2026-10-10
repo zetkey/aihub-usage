@@ -68,10 +68,16 @@ PEMAKAIAN TOKEN
 
 ## Dedupe dan celah log
 
-Dedupe memakai `(key_hash, id)`, jadi menjalankan CLI berkali-kali tidak
-menghitung ganda. Kalau antar-run ada log yang terlewat (kalah cepat dari batas
-1000 log), script mencetak baris `PERINGATAN` — jalankan lebih sering, mis. lewat
-cron, supaya celahnya makin kecil.
+Identitas log = `request_id` dari gateway (stabil antar-run). `id` yang juga
+dikirim gateway bukan identitas: itu nomor urut jendela (1 = terbaru) yang
+berubah tiap fetch, jadi tidak dipakai untuk dedupe. Dengan begitu menjalankan
+CLI berkali-kali tidak menghitung ganda. Kalau antar-run ada log yang terlewat
+(kalah cepat dari batas 1000 log), script mencetak baris `PERINGATAN` — jalankan
+lebih sering, mis. lewat cron, supaya celahnya makin kecil.
+
+Arsip lama (dedupe pakai `id`, bisa beku di 1000 baris pertama) dimigrasi
+otomatis saat dibuka; baris lamanya disimpan sebagai `legacy:<id>` dan
+digantikan baris asli begitu window baru memuat log yang sama.
 
 **Batas yang jujur:** arsip tidak menghapus batas 1000 log, hanya menambah cakupan
 seluas yang sempat terarsip. Log yang muncul dan hilang di antara dua run (lebih

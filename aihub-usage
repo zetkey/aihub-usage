@@ -438,7 +438,8 @@ TRUTHY = ("1", "true", "yes", "on")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS logs (
     key_hash          TEXT    NOT NULL,
-    id                INTEGER NOT NULL,
+    request_id        TEXT    NOT NULL,
+    id                INTEGER NOT NULL DEFAULT 0,
     created_at        INTEGER NOT NULL DEFAULT 0,
     type              INTEGER NOT NULL DEFAULT 0,
     model_name        TEXT    NOT NULL DEFAULT '',
@@ -446,10 +447,51 @@ CREATE TABLE IF NOT EXISTS logs (
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     quota             INTEGER NOT NULL DEFAULT 0,
     use_time          INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (key_hash, id)
+    PRIMARY KEY (key_hash, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_logs_key_time ON logs (key_hash, created_at);
 """
+
+# `id` dari gateway bukan identitas: itu nomor urut jendela (1 = terbaru) yang
+# berubah tiap fetch — dedupe pakai (key_hash, id) membuat arsip beku di 1000
+# baris pertama. Dedupe sekarang pakai request_id (stabil antar-run).
+SCHEMA_VERSION = 2
+
+
+def migrate_store(conn):
+    """Naikkan arsip lama (PK id) ke PK request_id, sekali jalan.
+
+    Baris tanpa request_id yang bisa dibaca (arsip v1) dijadikan `legacy:<id>`
+    supaya run pertama setelah upgrade: log window yang barannya sudah ada di
+    v1 dianggap duplikat (tidak menghitung ganda), dan dihapus saat run itu
+    karena digantikan baris request_id asli.
+    """
+    ver = conn.execute("PRAGMA user_version").fetchone()[0]
+    if ver == SCHEMA_VERSION:
+        return
+    tables = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")]
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(logs)")] \
+        if "logs" in tables else []
+    if cols and "request_id" not in cols:
+        # arsip v1 (PK id): rename, bikin skema baru, salin sbg legacy:<id>,
+        # buang v1. Run pertama sesudah upgrade: log window yang barannya
+        # sudah ada di v1 tidak dihitung ganda (legacy:<id> kena REPLACE),
+        # lalu baris legacy itu hilang karena digantikan request_id asli.
+        conn.execute("ALTER TABLE logs RENAME TO logs_v1")
+        conn.executescript(SCHEMA)
+        conn.execute("""
+            INSERT OR REPLACE INTO logs (key_hash, request_id, id, created_at,
+                type, model_name, prompt_tokens, completion_tokens, quota, use_time)
+            SELECT key_hash, 'legacy:' || id, id, created_at, type, model_name,
+                   prompt_tokens, completion_tokens, quota, use_time
+            FROM logs_v1 WHERE id IS NOT NULL
+        """)
+        conn.execute("DROP TABLE logs_v1")
+    else:
+        conn.executescript(SCHEMA)
+    conn.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+    conn.commit()
 
 def scope_of(key):
     """Identitas arsip untuk sebuah API key: SHA-256, bukan key itu sendiri."""
@@ -487,37 +529,65 @@ def open_store(path=None):
             os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
         conn = sqlite3.connect(path)
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-        conn.executescript(SCHEMA)
+        migrate_store(conn)
         conn.commit()
         return conn, None
     except (OSError, sqlite3.Error) as e:
         return None, "%s (%s)" % (e, path)
 
+def log_identity(l):
+    """request_id = identitas stabil log antar-run. `id` gateway cuma nomor
+    urut jendela (1 = terbaru, berubah tiap fetch), tidak boleh dipakai.
+    Baris tanpa request_id (kasus langka) → sidik jari konten deterministik;
+    dua request identik di detik sama berbagi kunci → yang kedua diabaikan
+    (undercount kecil, lebih aman dari menghitung ganda)."""
+    rid = str(l.get("request_id") or "").strip()
+    if rid:
+        return rid
+    return "fp:%s:%s:%s:%s:%s:%s" % (
+        to_int(l.get("created_at")), to_int(l.get("type")),
+        l.get("model_name") or "", to_int(l.get("prompt_tokens")),
+        to_int(l.get("completion_tokens")), to_int(l.get("quota")))
+
+
 def store_logs(conn, scope, logs):
     """Arsipkan log baru. Mengembalikan (jumlah_baru, ada_gap).
 
-    Dedupe lewat PRIMARY KEY (key_hash, id) + INSERT OR IGNORE, jadi menjalankan
-    CLI berkali-kali tidak menghitung ganda. `ada_gap` benar bila log tertua yang
-    baru diambil lebih baru dari log terbaru yang sudah diarsipkan — artinya ada
-    request di antaranya yang tidak pernah terlihat (kalah cepat dari 1000 log).
+    Dedupe lewat PRIMARY KEY (key_hash, request_id) + INSERT OR IGNORE, jadi
+    menjalankan CLI berkali-kali tidak menghitung ganda. `ada_gap` benar bila
+    log tertua yang baru diambil lebih baru dari log terbaru yang sudah
+    diarsipkan — artinya ada request di antaranya yang tidak pernah terlihat
+    (kalah cepat dari 1000 log).
     """
-    rows = [(scope, to_int(l.get("id")), to_int(l.get("created_at")),
+    rows = [(scope, log_identity(l), to_int(l.get("id")), to_int(l.get("created_at")),
              to_int(l.get("type")), str(l.get("model_name") or ""),
              to_int(l.get("prompt_tokens")), to_int(l.get("completion_tokens")),
              to_int(l.get("quota")), to_int(l.get("use_time")))
-            for l in logs if l.get("id") is not None]
+            for l in logs if l.get("request_id") or l.get("created_at")]
     if not rows:
         return 0, False
     prev_max, prev_count = conn.execute(
         "SELECT COALESCE(MAX(created_at), 0), COUNT(*) FROM logs WHERE key_hash = ?",
         (scope,)).fetchone()
-    times = [r[2] for r in rows if r[2]]
+    times = [r[3] for r in rows if r[3]]
     oldest = min(times) if times else 0
     before = conn.total_changes
     conn.executemany(
-        "INSERT OR IGNORE INTO logs (key_hash, id, created_at, type, model_name,"
-        " prompt_tokens, completion_tokens, quota, use_time)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+        "INSERT OR IGNORE INTO logs (key_hash, request_id, id, created_at, type,"
+        " model_name, prompt_tokens, completion_tokens, quota, use_time)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    # seam v1→v2: baris migrasi `legacy:<id>` yang isinya sama dengan log window
+    # baru adalah log yang sama dilihat dua kali — sisakan salinan request_id
+    # asli. Harus SETELAH insert: pada run pertama pasca-migrasi, baris pembanding
+    # baru saja masuk lewat window, bukan sudah ada di arsip.
+    conn.execute("""
+        DELETE FROM logs WHERE key_hash = ? AND request_id LIKE 'legacy:%'
+          AND (created_at, type, model_name, prompt_tokens, completion_tokens,
+               quota, use_time) IN (
+              SELECT created_at, type, model_name, prompt_tokens,
+                     completion_tokens, quota, use_time
+              FROM logs WHERE key_hash = ? AND request_id NOT LIKE 'legacy:%')
+    """, (scope, scope))
     conn.commit()
     added = conn.total_changes - before
     gap = bool(prev_count and oldest and oldest > prev_max)

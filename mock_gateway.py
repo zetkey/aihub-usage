@@ -27,15 +27,19 @@ TOKEN_LIMITED = {"code": True, "message": "ok", "data": {
     "model_limits_enabled": True, "expires_at": 1791458302}}
 LOGS = {"success": True, "message": "", "data": [
     {"id": 9002, "type": 5, "created_at": 1791458402, "token_name": "prod-hermes",
+     "request_id": "202610090001580000000005REQ9002",
      "model_name": "", "quota": 0, "prompt_tokens": 0, "completion_tokens": 0,
      "use_time": 2, "group": "auto", "content": "upstream timeout"},
     {"id": 9001, "type": 2, "created_at": 1791458302, "token_name": "prod-hermes",
+     "request_id": "202610090001440000000002REQ9001",
      "model_name": "gpt-5.5", "quota": 12_500, "prompt_tokens": 1200,
      "completion_tokens": 340, "use_time": 4, "is_stream": True, "group": "auto"},
     {"id": 9000, "type": 2, "created_at": 1791454702, "token_name": "prod-hermes",
+     "request_id": "202610082311000000000002REQ9000",
      "model_name": "deepseek-v4.1-flash", "quota": 5_000, "prompt_tokens": 800,
      "completion_tokens": 100, "use_time": 3, "group": "auto"},
     {"id": 8999, "type": 6, "created_at": 1791454702, "token_name": "prod-hermes",
+     "request_id": "202610082311000000000006REQ8999",
      "model_name": "", "quota": 0, "prompt_tokens": 0, "completion_tokens": 0,
      "use_time": 1, "group": "auto"}]}
 MODELS = {'object': 'list', 'data': [{'id': 'gpt-5.5'}, {'id': ''}, {'id': 'deepseek-v4.1-flash'}]}
@@ -72,6 +76,9 @@ ERRLOG = False
 EMPTY_LOGS = False
 # --emptychoices: /v1/chat/completions tanpa entri `choices`
 EMPTY_CHOICES = False
+# --posids: `id` = nomor urut jendela (1 = terbaru), meniru perilaku gateway
+# asli aihub.metranet.co.id — id berubah tiap fetch, hanya request_id yang stabil
+POSIDS = False
 
 
 class H(BaseHTTPRequestHandler):
@@ -153,7 +160,11 @@ class H(BaseHTTPRequestHandler):
                                    "message": "获取日志失败"}, 200)
             if EMPTY_LOGS:
                 return self._send({"success": True, "message": "", "data":[]})
-            return self._send(LOGS)
+            data = LOGS["data"]
+            if POSIDS:
+                # id terus berganti tiap fetch (1 = terbaru) tapi request_id tetap
+                data = [dict(l, id=len(data) - i) for i, l in enumerate(data)]
+            return self._send({"success": True, "message": "", "data": data})
         if p == "/v1/models":
             return self._send(MODELS)
         return self._send({"error": {"message": "Invalid URL (GET %s)" % p,
@@ -196,6 +207,7 @@ if __name__ == "__main__":
     ERRLOG = "--errlog" in sys.argv
     EMPTY_LOGS = "--emptylogs" in sys.argv
     EMPTY_CHOICES = "--emptychoices" in sys.argv
+    POSIDS = "--posids" in sys.argv
     port = int(sys.argv[1]) if sys.argv[1:2] and sys.argv[1].isdigit() else 8791
     # ThreadingHTTPServer: CLI memanggil endpoint secara paralel, jadi mock harus
     # bisa melayani request bersamaan (kalau tidak, paralelisme tidak terukur).
